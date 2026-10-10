@@ -1,4 +1,7 @@
 import os
+
+from PIL import Image
+
 os.environ["IMAGEMAGICK_BINARY"] = "/usr/bin/convert"
 import sys
 import logging
@@ -29,7 +32,7 @@ from moviepy import (
     VideoClip,
     TextClip,
     CompositeVideoClip,
-    concatenate_videoclips,
+    concatenate_videoclips, ImageClip,
 )
 import urllib.request
 import moviepy.audio.fx as afx
@@ -58,9 +61,11 @@ class StockAnalysis(BaseModel):
     interval: str = Field(description="Chart interval: '5m' for 1d, '1d' for others")
     key_levels: List[float] = Field(default=[], description="Important price levels to highlight on chart")
     highlight_type: str = Field(default="none", description="Type of overlay: 'breakout', 'support', 'resistance', or 'none'")
+    poses: List[int] = Field(description="A sequence of 12 to 22 avatar pose IDs (integers 1 to 20) that change dynamically to match the shifting sentiment of the script (1=Neutral, 2=Bullish, 3=Panic, 4=Thinking, 5=Shocked, 6=Stonks/Smart, 7=Crying, 8=Rocket, 9=Bored, 10=Laughing, 11-20=Talking and Explaining)")
 
 class FullVideoScriptSchema(BaseModel):
     intro_script: str = Field(description="STRICTLY 65 to 75 words English intro script with high CTA.")
+    intro_poses: List[int] = Field(description="A sequence of 12 to 22 avatar pose IDs (integers 1 to 20) for the intro section matching script sentiment changes.")
     analyzed_stocks: List[StockAnalysis]
     youtube_title: str
     description: str
@@ -209,6 +214,127 @@ def fetch_daily_market_news_from_rss() -> str:
 
 
 # ---------------------------------------------------------
+# Helper: Generate Avatar Video Clip Overlay
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# Helper: Load Green Screen Avatar & Make Background Transparent
+# ---------------------------------------------------------
+def render_avatar_clip(pose_id: int, duration: float) -> VideoClip:
+    """טוען את תמונת האוואטר מהמסך הירוק, מסיר את הרקע הירוק אוטומטית, ומחזיר קליפ וידאו שקוף."""
+    # בדיקת סיומות אפשריות (jfif או gfif)
+    img_path = f"assets/avatar/{pose_id}.jfif"
+    if not os.path.exists(img_path):
+        img_path = f"assets/avatar/{pose_id}.gfif"
+        if not os.path.exists(img_path):
+            img_path = "assets/avatar/1.jfif"  # ברירת מחדל אם הקובץ לא נמצא
+
+    try:
+        # פתיחת התמונה והמרתה לפורמט RGBA (שקיפות)
+        pil_img = Image.open(img_path).convert("RGBA")
+        arr = np.array(pil_img)
+
+        # זיהוי פיקסלים של המסך הירוק (כאשר הירוק גבוה משמעותית מהאדום והכחול)
+        r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+        green_mask = (g > 120) & (r < 110) & (b < 110)
+
+        # הפיכת הפיקסלים הירוקים לשקופים לחלוטין (Alpha = 0)
+        arr[green_mask, 3] = 0
+
+        # המרה בחזרה לאובייקט תמונה של PIL
+        transparent_pil_img = Image.fromarray(arr)
+
+        # יצירת ImageClip של MoviePy עם תמיכה בגרסה 2.x
+        avatar_clip = (
+            ImageClip(transparent_pil_img)
+            .with_duration(duration)
+            .resized(height=320)
+            .with_position(("right", 0.62), relative=True)  # מיקום בימין למטה מעל הכתוביות
+        )
+        return avatar_clip
+
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to process green screen for avatar {pose_id}: {e}")
+        # החזרת קליפ ריק במקרה של תקלה חריגה כדי שהרינדור לא יקרס
+        return VideoClip(lambda t: np.zeros((10, 10, 3), dtype=np.uint8), duration=duration)
+
+
+def get_processed_avatar_image(pose_id: int):
+    """טוען ישירות את תמונת האוואטר השקופה מתיקיית ה-PNG המוכנות מראש (מהיר במיוחד)."""
+    img_path = f"assets/avatar_clean/{pose_id}.png"
+    if not os.path.exists(img_path):
+        # נפילה חזרה לתיקייה הישנה במידה וסקריפט ההמרה טרם הופעל
+        old_path = f"assets/avatar/{pose_id}.jfif"
+        if not os.path.exists(old_path):
+            old_path = f"assets/avatar/{pose_id}.gfif"
+        if os.path.exists(old_path):
+            try:
+                pil_img = Image.open(old_path).convert("RGBA")
+                arr = np.array(pil_img)
+                r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+                green_mask = (g > 120) & (r < 110) & (b < 110)
+                arr[green_mask, 3] = 0
+                return np.array(Image.fromarray(arr))
+            except Exception:
+                pass
+        img_path = "assets/avatar_clean/1.png"
+        if not os.path.exists(img_path):
+            return np.zeros((100, 100, 4), dtype=np.uint8)
+
+    try:
+        pil_img = Image.open(img_path).convert("RGBA")
+        return np.array(pil_img)
+    except Exception:
+        return np.zeros((100, 100, 4), dtype=np.uint8)
+
+
+# ---------------------------------------------------------
+# Helper: Load Green Screen Avatar Sequence (Fixed for NumPy Array)
+# ---------------------------------------------------------
+def render_avatar_sequence_clip(pose_ids: List[int], duration: float) -> VideoClip:
+    """מקבל רשימת מזהי פוזיציות ומשך זמן כולל, ויוצר קליפ וידאו רציף שבו הדמות מתחלפת במהירות."""
+    if not pose_ids:
+        pose_ids = [1]
+
+    seg_duration = duration / len(pose_ids)
+    clips = []
+
+    for pose_id in pose_ids:
+        # בדיקת סיומות לקובצי המסך הירוק
+        img_path = f"assets/avatar/{pose_id}.jfif"
+        if not os.path.exists(img_path):
+            img_path = f"assets/avatar/{pose_id}.gfif"
+            if not os.path.exists(img_path):
+                img_path = "assets/avatar/1.jfif"
+
+        try:
+            # טעינה והסרת רקע מסך ירוק
+            pil_img = Image.open(img_path).convert("RGBA")
+            arr = np.array(pil_img)
+            r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+            green_mask = (g > 120) & (r < 110) & (b < 110)
+            arr[green_mask, 3] = 0
+            transparent_pil_img = Image.fromarray(arr)
+
+            # 💡 המרה למערך NumPy חיונית כדי ש-ImageClip יבין את התמונה
+            img_np = np.array(transparent_pil_img)
+
+            # יצירת קליפ קצר לפוזיציה הנוכחית
+            sub_clip = (
+                ImageClip(img_np)
+                .with_duration(seg_duration)
+                .resized(height=320)
+                .with_position(("right", 0.62), relative=True)
+            )
+            clips.append(sub_clip)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to process avatar pose {pose_id}: {e}")
+
+    if not clips:
+        return VideoClip(lambda t: np.zeros((10, 10, 3), dtype=np.uint8), duration=duration)
+
+    # שרשור כל הפוזות הקצרות לרצף אחד חלק
+    return concatenate_videoclips(clips)
+# ---------------------------------------------------------
 # 2. חילוץ ואימות טיקרים מתוך סיכום הרשת
 # ---------------------------------------------------------
 # ---------------------------------------------------------
@@ -243,6 +369,35 @@ def extract_and_verify_ticker_data(market_summary: str) -> dict:
             logger.warning(f"Failed to fetch market data for {ticker}: {e}")
 
     return verified_data
+
+
+# ---------------------------------------------------------
+# Helper: Fetch Top Movers for Right Sidebar
+# ---------------------------------------------------------
+def get_top_movers_data() -> List[dict]:
+    """שולף רשימת מניות פופולריות, מחשב אחוז שינוי ומחזיר את המובילות לטבלה בצד ימין."""
+    default_tickers = ["NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "AMD", "NFLX", "SPY"]
+    movers = []
+
+    for ticker in default_tickers:
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="5d")
+            if len(hist) >= 2:
+                last_close = float(hist['Close'].iloc[-1])
+                prev_close = float(hist['Close'].iloc[-2])
+                pct = ((last_close - prev_close) / prev_close) * 100.0
+                movers.append({
+                    "ticker": ticker,
+                    "price": last_close,
+                    "pct": pct
+                })
+        except Exception:
+            continue
+
+    # מיון לפי גודל התנועה האבסולוטית או לפי שינוי יומי
+    movers = sorted(movers, key=lambda x: abs(x['pct']), reverse=True)
+    return movers[:7]  # מחזיר את 7 המניות המובילות
 
 
 # ---------------------------------------------------------
@@ -313,7 +468,12 @@ def run_perfect_pipeline(
         temp_files.append(intro_audio_file)
 
         market_data = fetch_intro_index_data()
-        intro_clip = render_dynamic_intro_clip(market_data, intro_audio_file, intro_duration)
+        intro_clip = render_dynamic_intro_clip(
+            market_data,
+            intro_audio_file,
+            intro_duration,
+            pose_ids=script_schema.intro_poses
+        )
         intro_clip = add_subtitles(intro_clip, script_schema.intro_script)
 
         timestamps.append(f"{format_seconds_to_timestamp(current_time)} Market Overview")
@@ -360,13 +520,13 @@ def run_perfect_pipeline(
         logger.info(f"💾 Rendering final video file: {output_filename}...")
         final_video.write_videofile(
             output_filename,
-            fps=30,
+            fps=15,
             codec="libx264",
             audio_codec="aac",
+            threads=8,
             bitrate="8000k",
-            logger=None,
-            threads=1,
-            preset="ultrafast"
+            preset="ultrafast",
+            ffmpeg_params=["-crf", "20"]
         )
 
         # === חלק 8: Thumbnail והעלאה ליוטיוב ===
@@ -433,9 +593,14 @@ def render_outro_clip(duration: float = 5.0) -> VideoClip:
     return VideoClip(make_frame, duration=duration)
 
 
-def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: float) -> VideoClip:
+# ---------------------------------------------------------
+# Modified: Dynamic Intro Clip with Top/Bottom Tapes & Right Panel
+# ---------------------------------------------------------
+def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: float,
+                              pose_ids: List[int] = [1]) -> VideoClip:
     logger.info(f"Rendering Dynamic Intro (Duration: {duration:.2f}s)...")
     voice_clip = AudioFileClip(audio_path)
+    top_movers = get_top_movers_data()
 
     fig = plt.figure(figsize=(19.2, 10.8), dpi=100)
     canvas = FigureCanvasAgg(fig)
@@ -444,8 +609,7 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
     assets = ["QQQ", "SPY", "BTC"]
     colors = {"QQQ": "#00E5FF", "SPY": "#00FFA3", "BTC": "#FFB800"}
     seg_dur = duration / 3.0
-
-    frame_cache = {}  # 🚀 מטמון זיכרון מואץ
+    frame_cache = {}
 
     def make_frame(t):
         asset_idx = min(int(t // seg_dur), 2)
@@ -453,18 +617,71 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
         progress = min(local_t / seg_dur, 1.0)
         curr_step = max(1, int(progress * len(x_smooth)))
 
-        cache_key = (asset_idx, curr_step)
+        pose_idx = int((t / duration) * len(pose_ids)) % len(pose_ids)
+        current_pose_id = pose_ids[pose_idx]
+
+        # Cache key יציב שמונע חישוב כפול ומאיץ את הרינדור
+        cache_key = (asset_idx, curr_step, current_pose_id)
         if cache_key in frame_cache:
             return frame_cache[cache_key]
 
         fig.clf()
         fig.patch.set_facecolor('#0B0E14')
-        ax = fig.add_axes([0.08, 0.12, 0.88, 0.73])
-        ax.set_facecolor('#0B0E14')
 
-        fig.text(0.08, 0.93, "MARKET OVERVIEW: QQQ | SPY | BTC", fontsize=24, fontweight='bold', color='#FFFFFF')
-        fig.text(0.08, 0.89, f"{market_data['date_str']} | Cumulative Intraday Trend", fontsize=14, color='#8B949E')
+        # 1. פאנל גרף ראשי (שמאל) עם תוויות לבנות
+        ax = fig.add_axes([0.04, 0.12, 0.70, 0.72])
+        ax.set_facecolor('#141A26')
 
+        # 2. פאנל ימני עליון: TOP MOVERS (קופסא בהירה יותר וקווי הפרדה)
+        ax_right = fig.add_axes([0.76, 0.44, 0.20, 0.40])
+        ax_right.set_facecolor('#1E2536')
+        ax_right.axis('off')
+        ax_right.text(0.5, 0.88, "TOP MOVERS", color='#FFFFFF', fontsize=13, fontweight='bold', ha='center',
+                      transform=ax_right.transAxes)
+
+        y_pos = 0.70
+        for i, m in enumerate(top_movers[:5]):
+            c_col = '#00FFA3' if m['pct'] >= 0 else '#FF3366'
+            sign = "+" if m['pct'] >= 0 else ""
+            ax_right.text(0.10, y_pos, f"{m['ticker']}", color='#FFFFFF', fontsize=11, fontweight='bold',
+                          transform=ax_right.transAxes)
+            ax_right.text(0.45, y_pos, f"${m['price']:.1f}", color='#8B949E', fontsize=11, transform=ax_right.transAxes)
+            ax_right.text(0.85, y_pos, f"{sign}{m['pct']:.1f}%", color=c_col, fontsize=11, fontweight='bold',
+                          ha='right', transform=ax_right.transAxes)
+
+            if i < 4:
+                ax_right.plot([0.08, 0.92], [y_pos - 0.07, y_pos - 0.07], color='#3A4B68', linewidth=1, linestyle='-',
+                              transform=ax_right.transAxes)
+            y_pos -= 0.14
+
+        # 3. פאנל ימני תחתון: אוואטר
+        ax_avatar = fig.add_axes([0.76, 0.12, 0.20, 0.29])
+        ax_avatar.set_facecolor('#1E2536')
+        ax_avatar.axis('off')
+        avatar_img = get_processed_avatar_image(current_pose_id)
+        ax_avatar.imshow(avatar_img)
+
+        # 4. פס קרוסלה אינסופי (עליון ותחתון) עם קופסאות כהות מאחורי הטקסט
+        tape_items = [f"{m['ticker']} \${m['price']:.2f} ({'+' if m['pct'] >= 0 else ''}{m['pct']:.2f}%)" for m in
+                      top_movers] * 10
+        tape_str = "     |     ".join(tape_items * 4)
+        scroll_offset = (t * 60 + 500) % 1000
+
+        ax_top_tape = fig.add_axes([0.04, 0.93, 0.92, 0.04])
+        ax_top_tape.set_facecolor('#141A26')
+        ax_top_tape.axis('off')
+        ax_top_tape.text(1.0 - (scroll_offset / 500.0), 0.5, f"LIVE TICKER >> {tape_str}", color='#FFFFFF', fontsize=11,
+                         fontweight='bold', va='center', transform=ax_top_tape.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#3A4B68', alpha=0.9))
+
+        ax_bot_tape = fig.add_axes([0.04, 0.02, 0.92, 0.04])
+        ax_bot_tape.set_facecolor('#141A26')
+        ax_bot_tape.axis('off')
+        ax_bot_tape.text(1.0 - (scroll_offset / 500.0), 0.5, f"MARKET ALERTS >> {tape_str}", color='#FFFFFF',
+                         fontsize=11, fontweight='bold', va='center', transform=ax_bot_tape.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#3A4B68', alpha=0.9))
+
+        # ציור הגרפים ותוויות המדד שזזות עם הקו
         all_visible_y = []
         for idx, asset in enumerate(assets):
             y_vals, current_price = market_data[asset]
@@ -478,43 +695,47 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
             else:
                 p_step = curr_step
 
-            ax.plot(x_smooth[:p_step], y_vals[:p_step], color=c_color, linewidth=3.5, label=asset)
-            ax.scatter(x_smooth[p_step-1], y_vals[p_step-1], color=c_color, s=120, zorder=10)
+            ax.plot(x_smooth[:p_step], y_vals[:p_step], color=c_color, linewidth=2.5, label=asset)
+            ax.scatter(x_smooth[p_step - 1], y_vals[p_step - 1], color=c_color, s=80, zorder=10)
 
-            ax.text(
-                x_smooth[p_step-1], y_vals[p_step-1],
-                f" {asset}: ${current_price:,.2f}",
-                color=c_color, fontsize=13, fontweight='bold', va='center',
-                bbox=dict(boxstyle="round,pad=0.2", facecolor='#0B0E14', edgecolor=c_color, alpha=0.85)
-            )
+            curr_pct = y_vals[p_step - 1]
+            sign_str = "+" if curr_pct >= 0 else ""
+            ax.text(x_smooth[p_step - 1], curr_pct + 0.1, f"{asset} {sign_str}{curr_pct:.2f}%",
+                    color='#FFFFFF', fontsize=12, fontweight='bold', ha='center', va='bottom',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor='#1E2536', edgecolor=c_color, alpha=0.9))
+
             all_visible_y.extend(y_vals[:p_step])
 
         ax.set_xlim(-0.02, 1.15)
         if all_visible_y:
-            ax.set_ylim(min(all_visible_y) - 0.5, max(all_visible_y) + 0.8)
+            ax.set_ylim(min(all_visible_y) - 0.5, max(all_visible_y) + 1.2)
 
-        ax.grid(True, linestyle='--', alpha=0.15, color='#8B949E')
-        for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
-        for spine in ['left', 'bottom']: ax.spines[spine].set_color('#30363D')
+        ax.tick_params(axis='both', colors='white', labelsize=12)
+        ax.grid(True, linestyle='--', alpha=0.15, color='#2A3447')
+        for spine in ['top', 'right', 'left', 'bottom']: ax.spines[spine].set_color('#3A4B68')
 
         canvas.draw()
         frame_img = np.asarray(canvas.buffer_rgba())[:, :, :3]
         frame_cache[cache_key] = frame_img
         return frame_img
 
-    clip = VideoClip(make_frame, duration=duration).with_audio(voice_clip)
-    return clip
+    return VideoClip(make_frame, duration=duration).with_audio(voice_clip)
 
 # ---------------------------------------------------------
 # 5. Dynamic Stock Chart with Annotations
 # ---------------------------------------------------------
 
 
+# ---------------------------------------------------------
+# Modified: Annotated Stock Clip with Side Panel & Tapes
+# ---------------------------------------------------------
 def render_annotated_stock_clip(stock_info: StockAnalysis, verified_price: float, audio_path: str,
                                 duration: float) -> VideoClip:
     ticker = stock_info.ticker
-    logger.info(f"Rendering animated chart for {ticker} with levels {stock_info.key_levels}...")
+    logger.info(f"Rendering animated chart for {ticker}...")
     voice_clip = AudioFileClip(audio_path)
+    top_movers = get_top_movers_data()
+    pose_ids = stock_info.poses if stock_info.poses else [1]
 
     df = yf.Ticker(ticker).history(period=stock_info.timeframe, interval=stock_info.interval, prepost=True).dropna()
     if df.empty:
@@ -534,44 +755,94 @@ def render_annotated_stock_clip(stock_info: StockAnalysis, verified_price: float
     y_min, y_max = lows.min(), highs.max()
     y_range = max(1.0, y_max - y_min)
 
+    frame_cache = {}
+
     def make_frame(t):
+        progress_anim = min(t / duration, 1.0)
+        pose_idx = int((t / duration) * len(pose_ids)) % len(pose_ids)
+        current_pose_id = pose_ids[pose_idx]
+
+        cache_key = (int(progress_anim * 50), current_pose_id)
+        if cache_key in frame_cache:
+            return frame_cache[cache_key]
+
         fig.clf()
         fig.patch.set_facecolor('#0B0E14')
 
-        ax = fig.add_axes([0.08, 0.10, 0.88, 0.70])
-        ax.set_facecolor('#0B0E14')
+        # 1. פאנל גרף ראשי (שמאל)
+        ax = fig.add_axes([0.04, 0.12, 0.70, 0.72])
+        ax.set_facecolor('#141A26')
 
-        # Draw Candlesticks
+        # 2. פאנל ימני עליון: TOP MOVERS (קופסא בהירה וקווי הפרדה)
+        ax_right = fig.add_axes([0.76, 0.44, 0.20, 0.40])
+        ax_right.set_facecolor('#1E2536')
+        ax_right.axis('off')
+        ax_right.text(0.5, 0.88, "TOP MOVERS", color='#FFFFFF', fontsize=13, fontweight='bold', ha='center',
+                      transform=ax_right.transAxes)
+
+        y_pos = 0.70
+        for i, m in enumerate(top_movers[:5]):
+            c_col = '#00FFA3' if m['pct'] >= 0 else '#FF3366'
+            sign = "+" if m['pct'] >= 0 else ""
+            ax_right.text(0.10, y_pos, f"{m['ticker']}", color='#FFFFFF', fontsize=11, fontweight='bold',
+                          transform=ax_right.transAxes)
+            ax_right.text(0.45, y_pos, f"${m['price']:.1f}", color='#8B949E', fontsize=11, transform=ax_right.transAxes)
+            ax_right.text(0.85, y_pos, f"{sign}{m['pct']:.1f}%", color=c_col, fontsize=11, fontweight='bold',
+                          ha='right', transform=ax_right.transAxes)
+
+            if i < 4:
+                ax_right.plot([0.08, 0.92], [y_pos - 0.07, y_pos - 0.07], color='#3A4B68', linewidth=1, linestyle='-',
+                              transform=ax_right.transAxes)
+            y_pos -= 0.14
+
+        # 3. פאנל ימני תחתון: אוואטר
+        ax_avatar = fig.add_axes([0.76, 0.12, 0.20, 0.29])
+        ax_avatar.set_facecolor('#1E2536')
+        ax_avatar.axis('off')
+        avatar_img = get_processed_avatar_image(current_pose_id)
+        ax_avatar.imshow(avatar_img)
+
+        # 4. פס קרוסלה אינסופי (עליון ותחתון) עם קופסאות כהות
+        tape_items = [f"{m['ticker']} \${m['price']:.2f} ({'+' if m['pct'] >= 0 else ''}{m['pct']:.2f}%)" for m in
+                      top_movers] * 10
+        tape_str = "     |     ".join(tape_items * 4)
+        scroll_offset = (t * 60 + 500) % 1000
+
+        ax_top_tape = fig.add_axes([0.04, 0.93, 0.92, 0.04])
+        ax_top_tape.set_facecolor('#141A26')
+        ax_top_tape.axis('off')
+        ax_top_tape.text(1.0 - (scroll_offset / 500.0), 0.5, f"LIVE TICKER >> {tape_str}", color='#FFFFFF', fontsize=11,
+                         fontweight='bold', va='center', transform=ax_top_tape.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#3A4B68', alpha=0.9))
+
+        ax_bot_tape = fig.add_axes([0.04, 0.02, 0.92, 0.04])
+        ax_bot_tape.set_facecolor('#141A26')
+        ax_bot_tape.axis('off')
+        ax_bot_tape.text(1.0 - (scroll_offset / 500.0), 0.5, f"MARKET ALERTS >> {tape_str}", color='#FFFFFF',
+                         fontsize=11, fontweight='bold', va='center', transform=ax_bot_tape.transAxes,
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#3A4B68', alpha=0.9))
+
+        # ציור נרות הגרף
         ax.vlines(x_idxs, lows, highs, color=candle_colors, linewidth=1.2)
         ax.bar(x_idxs, closes - opens, bottom=opens, color=candle_colors, width=0.6)
 
-        # Dynamic motion: subtle zoom-in over time
-        progress = min(t / duration, 1.0)
-        start_x = int(len(df) * 0.15 * progress)
+        start_x = int(len(df) * 0.15 * progress_anim)
         end_x = len(df) - 1
         ax.set_xlim(start_x, end_x + max(2, int(len(df) * 0.05)))
         ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.12)
 
-        # Blinking / pulsing key levels
         blink_alpha = 0.45 + 0.45 * np.abs(np.sin(np.pi * t * 1.5))
 
         for level in stock_info.key_levels:
             ax.axhline(y=level, color='#FFD700', linestyle='--', linewidth=2.0, alpha=blink_alpha)
-
-            # Position label ABOVE the level line and shifted LEFT inside screen
             label_x_idx = int(start_x + (end_x - start_x) * 0.82)
             ax.text(label_x_idx, level + y_range * 0.02, f"Key Level: ${level:.2f}",
-                    color='#FFD700', fontsize=12, fontweight='bold', ha='right', va='bottom',
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor='#0B0E14', edgecolor='#FFD700', alpha=0.85))
+                    color='#FFD700', fontsize=11, fontweight='bold', ha='right', va='bottom',
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor='#1E2536', edgecolor='#FFD700', alpha=0.85))
 
-        # Annotations pointing accurately to actual key levels inside screen limits
-        if stock_info.key_levels:
-            target_level = stock_info.key_levels[0]
-        else:
-            target_level = closes[-1]
-
+        target_level = stock_info.key_levels[0] if stock_info.key_levels else closes[-1]
         arrow_x = int(start_x + (end_x - start_x) * 0.70)
-        text_x = int(start_x + (end_x - start_x) * 0.40)
+        text_x = int(start_x + (end_x - start_x) * 0.35)
 
         h_type = stock_info.highlight_type.lower()
         if h_type == "breakout":
@@ -579,28 +850,31 @@ def render_annotated_stock_clip(stock_info: StockAnalysis, verified_price: float
                         xy=(arrow_x, target_level),
                         xytext=(text_x, target_level + y_range * 0.08),
                         arrowprops=dict(facecolor='#00FFA3', edgecolor='#00FFA3', shrink=0.08, width=2, headwidth=7),
-                        fontsize=13, fontweight='bold', color='#00FFA3',
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor='#0B0E14', edgecolor='#00FFA3', alpha=0.85))
+                        fontsize=12, fontweight='bold', color='#00FFA3',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#00FFA3', alpha=0.85))
         elif h_type == "support":
             ax.annotate('SUPPORT LEVEL',
                         xy=(arrow_x, target_level),
                         xytext=(text_x, target_level - y_range * 0.08),
                         arrowprops=dict(facecolor='#00E5FF', edgecolor='#00E5FF', shrink=0.08, width=2, headwidth=7),
-                        fontsize=13, fontweight='bold', color='#00E5FF',
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor='#0B0E14', edgecolor='#00E5FF', alpha=0.85))
+                        fontsize=12, fontweight='bold', color='#00E5FF',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='#1E2536', edgecolor='#00E5FF', alpha=0.85))
 
-        fig.text(0.08, 0.90, f"{ticker} - {stock_info.company_spoken_name}", fontsize=26, fontweight='bold', color='#FFFFFF')
-        fig.text(0.08, 0.85, f"Verified Price: ${verified_price:.2f} | Timeframe: {stock_info.timeframe}", fontsize=14, color='#8B949E')
+        fig.text(0.04, 0.90, f"{ticker} - {stock_info.company_spoken_name}", fontsize=22, fontweight='bold',
+                 color='#FFFFFF')
+        fig.text(0.04, 0.86, f"Verified Price: ${verified_price:.2f} | Timeframe: {stock_info.timeframe}", fontsize=12,
+                 color='#8B949E')
 
-        ax.grid(True, linestyle='--', alpha=0.15, color='#8B949E')
-        for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
-        for spine in ['left', 'bottom']: ax.spines[spine].set_color('#30363D')
+        ax.tick_params(axis='both', colors='white', labelsize=12)
+        ax.grid(True, linestyle='--', alpha=0.15, color='#2A3447')
+        for spine in ['top', 'right', 'left', 'bottom']: ax.spines[spine].set_color('#3A4B68')
 
         canvas.draw()
-        return np.asarray(canvas.buffer_rgba())[:, :, :3]
+        frame_img = np.asarray(canvas.buffer_rgba())[:, :, :3]
+        frame_cache[cache_key] = frame_img
+        return frame_img
 
-    clip = VideoClip(make_frame, duration=duration).with_audio(voice_clip)
-    return clip
+    return VideoClip(make_frame, duration=duration).with_audio(voice_clip)
 
 # ---------------------------------------------------------
 # Subtitles & Final Pipeline Assembly
@@ -623,8 +897,6 @@ def get_system_font_path() -> str:
 
 def add_subtitles(video_clip: VideoClip, text: str) -> CompositeVideoClip:
     clean_text = re.sub(r'[^\x00-\x7F]+', '', text).strip()
-
-    # Split text into sentences for synchronized line-by-line display
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', clean_text) if s.strip()]
     if not sentences:
         sentences = [clean_text]
@@ -633,35 +905,57 @@ def add_subtitles(video_clip: VideoClip, text: str) -> CompositeVideoClip:
     total_words = sum(words_per_sentence)
     total_duration = video_clip.duration
 
-    box_width = int(video_clip.w * 0.85)
-    box_height = 140
+    canvas_width = int(video_clip.w * 0.85)
+    canvas_height = 140
     font_path = get_system_font_path()
 
     subtitle_clips = [video_clip]
     start_time = 0.0
+
+    try:
+        from PIL import ImageFont, ImageDraw
+        pil_font = ImageFont.truetype(font_path, 40)
+    except Exception:
+        pil_font = None
 
     for idx, (sent, w_count) in enumerate(zip(sentences, words_per_sentence)):
         sent_duration = (w_count / total_words) * total_duration
         if idx == len(sentences) - 1:
             sent_duration = max(sent_duration, total_duration - start_time)
 
-        try:
-            txt = TextClip(
-                text=sent,
-                font=font_path,
-                font_size=34,
-                color='yellow',
-                method='caption',
-                size=(box_width, box_height)
-            ).with_start(start_time).with_duration(sent_duration).with_position(('center', 0.85), relative=True)
+        display_text = sent.upper()
+        img_filename = f"temp_sub_{abs(hash(display_text))}_{idx}.png"
 
-            subtitle_clips.append(txt)
+        try:
+            img = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+
+            if pil_font:
+                bbox = draw.textbbox((0, 0), display_text, font=pil_font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tx, ty = (canvas_width - tw) / 2, (canvas_height - th) / 2
+
+                draw.text(
+                    (tx, ty),
+                    display_text,
+                    font=pil_font,
+                    fill="#FFFFFF",  # טקסט לבן
+                    stroke_width=4,  # קונטור שחור
+                    stroke_fill="black"
+                )
+
+            img.save(img_filename)
+            # 🚀 הוספת .with_start(start_time) כדי שהכתוביות יופיעו בזו אחר זו ולא אחת על השנייה
+            txt_clip = ImageClip(img_filename).with_start(start_time).with_duration(sent_duration).with_position(
+                ('center', 0.82), relative=True)
+            subtitle_clips.append(txt_clip)
         except Exception as e:
-            logger.warning(f"Failed to render subtitle for line '{sent}': {e}")
+            logger.warning(f"Failed to render subtitle image for line '{sent}': {e}")
 
         start_time += sent_duration
 
     return CompositeVideoClip(subtitle_clips)
+
 
 if __name__ == "__main__":
     run_perfect_pipeline()
