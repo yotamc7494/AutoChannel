@@ -5,6 +5,7 @@ import logging
 import asyncio
 import json
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
@@ -30,6 +31,7 @@ from moviepy import (
     CompositeVideoClip,
     concatenate_videoclips,
 )
+import urllib.request
 import moviepy.audio.fx as afx
 from dotenv import load_dotenv
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
@@ -106,272 +108,6 @@ def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.m
     return duration
 
 # ---------------------------------------------------------
-# 1. RSS & Robust Multi-Method Transcript Extraction
-# ---------------------------------------------------------
-MICHA_STOCKS_RSS = "https://www.youtube.com/feeds/videos.xml?channel_id=UCSxjNbPriyBh9RNl_QNSAtw"
-
-def get_latest_micha_video_url() -> Optional[str]:
-    logger.info("📡 Fetching latest video URL from YouTube RSS...")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    try:
-        response = requests.get(MICHA_STOCKS_RSS, headers=headers, timeout=10)
-        if response.status_code == 200:
-            root = ET.fromstring(response.content)
-            entry = root.find("{http://www.w3.org/2005/Atom}entry")
-            if entry is not None:
-                video_url = entry.find("{http://www.w3.org/2005/Atom}link").attrib.get("href")
-                title = entry.find("{http://www.w3.org/2005/Atom}title").text
-                logger.info(f"🎥 Found Latest Video: '{title}' ({video_url})")
-                return video_url
-        else:
-            logger.error(f"❌ Failed to fetch RSS: HTTP Status {response.status_code}")
-    except Exception as e:
-        logger.error(f"❌ Exception fetching RSS: {e}")
-    return None
-
-
-def extract_video_id(url: str) -> Optional[str]:
-    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
-    return match.group(1) if match else None
-
-
-def fetch_youtube_transcript_robust(video_id: str) -> Optional[str]:
-    """
-    תומך בכל הגרסאות של youtube-transcript-api (כולל כתוביות אוטומטיות בעברית iw).
-    אם התמליל נכשל, מבצע חילוץ כתוביות דרך yt-dlp ללא הורדת אודיו/וידאו.
-    """
-    logger.info(f"📜 Attempting to fetch transcript for video ID: {video_id}...")
-    # 'iw' היא השפה הראשית של כתוביות אוטומטיות בעברית ביוטיוב!
-    target_languages = ['iw', 'he', 'en']
-
-    # דרך 1: קריאה ל-get_transcript ברמת המחלקה
-    try:
-        if hasattr(YouTubeTranscriptApi, 'get_transcript'):
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=target_languages)
-            text = " ".join([
-                item['text'] if isinstance(item, dict) else getattr(item, 'text', '')
-                for item in transcript
-            ])
-            if text.strip():
-                logger.info("✅ Retrieved transcript via static YouTubeTranscriptApi.get_transcript")
-                return text
-    except Exception as e:
-        logger.warning(f"⚠️ Static get_transcript failed: {e}")
-
-    # דרך 2: שימוש ב-list_transcripts (תומך בכתוביות אוטומטיות iw/he)
-    try:
-        if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            try:
-                transcript_obj = transcript_list.find_transcript(target_languages)
-            except Exception:
-                # ניסיון למצוא כתוביות שנוצרו אוטומטית (generated)
-                transcript_obj = transcript_list.find_generated_transcript(target_languages)
-
-            transcript_data = transcript_obj.fetch()
-            text = " ".join([
-                item['text'] if isinstance(item, dict) else getattr(item, 'text', '')
-                for item in transcript_data
-            ])
-            if text.strip():
-                logger.info(f"✅ Retrieved transcript via list_transcripts ({transcript_obj.language_code})")
-                return text
-    except Exception as e:
-        logger.warning(f"⚠️ list_transcripts failed: {e}")
-
-    # דרך 3: ניסיון יצירת אובייקט (לגרסאות חדשות של הספריה)
-    try:
-        api_instance = YouTubeTranscriptApi()
-        fetch_method = getattr(api_instance, 'fetch', getattr(api_instance, 'get_transcript', None))
-        if fetch_method:
-            try:
-                transcript = fetch_method(video_id, languages=target_languages)
-            except TypeError:
-                transcript = fetch_method(video_id)
-
-            text = " ".join([
-                item.text if hasattr(item, 'text') else item.get('text', '')
-                for item in transcript
-            ])
-            if text.strip():
-                logger.info("✅ Retrieved transcript via YouTubeTranscriptApi instance call")
-                return text
-    except Exception as e:
-        logger.warning(f"⚠️ Instance transcript fetch failed: {e}")
-
-    # דרך 4: חילוץ כתוביות טקסט ישירות מ-yt-dlp (כולל עקיפת מנגנוני anti-bot)
-    try:
-        logger.info("📜 Falling back to yt-dlp subtitle metadata extraction...")
-        ydl_opts = {
-            'skip_download': True,
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': target_languages,
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['mweb', 'android', 'tv_embedded'],
-                }
-            },
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            subtitles = info.get('subtitles') or info.get('automatic_captions')
-            if subtitles:
-                for lang in target_languages:
-                    if lang in subtitles:
-                        json_sub = next((s['url'] for s in subtitles[lang] if s.get('ext') == 'json3'), None)
-                        if json_sub:
-                            resp = requests.get(json_sub, timeout=10)
-                            if resp.status_code == 200:
-                                events = resp.json().get('events', [])
-                                text_parts = [
-                                    seg.get('utf8', '').strip()
-                                    for ev in events for seg in ev.get('segs', [])
-                                    if seg.get('utf8', '').strip()
-                                ]
-                                full_text = " ".join(text_parts)
-                                if full_text.strip():
-                                    logger.info("✅ Retrieved transcript via yt-dlp subtitle JSON stream")
-                                    return full_text
-    except Exception as e:
-        logger.warning(f"⚠️ Subtitle metadata extraction failed: {e}")
-
-    return None
-
-
-def download_youtube_audio_fallback(video_url: str, output_path="micha_input.m4a") -> str:
-    """
-    מופעל רק כגיבוי אחרון אם לא נמצאו כתוביות כלל.
-    מוריד אודיו בפורמט m4a ישיר ללא צורך בהמרת FFmpeg.
-    """
-    logger.info(f"📥 Downloading audio fallback from {video_url}...")
-
-    ydl_opts = {
-        'format': 'm4a/bestaudio/best',  # הורדה ישירה של קובץ אודיו ללא צורך ב-FFmpeg
-        'outtmpl': output_path,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'android', 'tv_embedded', 'ios'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        }
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
-    return output_path
-
-def transcribe_audio_with_gemini(audio_path: str) -> str:
-    logger.info("🧠 Transcribing audio with Financial Glossary Prompt...")
-    client = get_gemini_client()
-    audio_file = client.files.upload(file=audio_path)
-
-    glossary_prompt = """
-    תמלל את סרטון הסקירה הפיננסית במיקוד גבוה.
-    
-    מילון מונחים ודגשי תעתיק (השתמש במונחים אלה לדיוק מירבי):
-    - מדדים ומניות: S&P 500, נאסד"ק (Nasdaq), ביטקוין (Bitcoin), QQQ, SPY, NVDA, TSLA, AAPL, AMZN, MSFT, GOOGL, META, AMD, INTEL.
-    - מושגי מסחר: אופציות, פוטים (Puts), קולים (Calls), שורט (Short), לונג (Long), תמיכה (Support), התנגדות (Resistance), פריצה (Breakout), נר פטיש (Hammer Candle), נר היפוך, מחזור מסחר (Volume), גאפ (Gap).
-
-    חלץ תמלול מדויק של כל המדדים, המניות והרמות הטכניות המוזכרות בסרטון.
-    """
-
-    response = client.models.generate_content(
-        model="gemini-flash-lite-latest",
-        contents=[audio_file, glossary_prompt]
-    )
-    client.files.delete(name=audio_file.name)
-    return response.text
-
-# ---------------------------------------------------------
-# 2. Market Data Verification
-# ---------------------------------------------------------
-def extract_and_verify_ticker_data(raw_transcript: str) -> dict:
-    logger.info("🔍 Extracting mentioned tickers and fetching ground-truth data...")
-    client = get_gemini_client()
-
-    prompt = f"Extract all stock tickers mentioned in this text as a JSON array of strings (e.g. ['NVDA', 'TSLA']): {raw_transcript}"
-    res = client.models.generate_content(model="gemini-flash-lite-latest", contents=prompt)
-    tickers = []
-    try:
-        tickers = json.loads(re.search(r'\[.*\]', res.text, re.DOTALL).group(0))
-    except Exception:
-        tickers = ["NVDA", "TSLA", "AAPL"]
-
-    verified_data = {}
-    for ticker in tickers:
-        try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period="5d")
-            if not hist.empty:
-                last_close = float(hist['Close'].iloc[-1])
-                prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else last_close
-                pct_change = ((last_close - prev_close) / prev_close) * 100
-                verified_data[ticker] = {
-                    "price": round(last_close, 2),
-                    "pct_change": round(pct_change, 2)
-                }
-        except Exception as e:
-            logger.warning(f"Failed to fetch market data for {ticker}: {e}")
-
-    return verified_data
-
-# ---------------------------------------------------------
-# 3. AI Script Generation with Structured Schema
-# ---------------------------------------------------------
-def generate_verified_script(transcript: str, verified_market_data: dict) -> FullVideoScriptSchema:
-    logger.info("Generating structured video script with enhanced CTA...")
-    client = get_gemini_client()
-
-    prompt = f"""
-    You are a top-tier Wall Street video producer and YouTube Shorts retention strategist.
-    Synthesize this transcript and VERIFIED market data into an English script for short-form video.
-
-    Raw Transcript:
-    {transcript}
-
-    Verified Market Data (MUST USE THESE EXACT NUMBERS):
-    {json.dumps(verified_market_data, indent=2)}
-
-    CRITICAL SCRIPTING & CTA RULES:
-    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK (STRICTLY 15 TO 25 WORDS, ~5-7 SECONDS). 
-       - DO NOT give a broad market summary. Focus ONLY on the single biggest market shock, catalyst, or extreme price move across QQQ, SPY, or BTC.
-       - Use high-impact, dramatic trigger words (e.g., 'Wall Street is in panic mode', 'Massive breakout underway', 'Liquidation wave hitting markets').
-       - Transition IMMEDIATELY into the stock breakdowns without fluff.
-
-    2. "analyzed_stocks": Max 4 key stocks. Provide exact technical key levels (e.g. [120.0, 125.0]).
-       - In the narrative script, DO NOT just give flat facts. Explicitly explain WHAT is expected to happen when price reaches those key levels (e.g., "If Nvidia breaks above 125, expect a rally toward 135. But if support at 120 fails, a quick drop is coming!").
-       - End each stock breakdown with a sharp, context-aware closing line tied directly to the key price level (e.g., 'If 125 holds, this could squeeze fast—if not, watch out below.', or '120 is the absolute line in the sand tomorrow.'). NEVER use repetitive generic phrases like 'Drop your thoughts below' or 'What do you think'.
-
-    3. ABSOLUTELY NO EMOJIS in any field (title, description, scripts, tags). Emojis fail to render properly.
-    4. Accentuate actionable key levels and price targets.
-    """
-
-    response = client.models.generate_content(
-        model="gemini-flash-lite-latest",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=FullVideoScriptSchema
-        )
-    )
-    return FullVideoScriptSchema.model_validate_json(response.text)
-
-# ---------------------------------------------------------
 # 4. Dynamic 30-Sec Intro Rendering
 # ---------------------------------------------------------
 def fetch_intro_index_data():
@@ -430,6 +166,248 @@ def fetch_intro_index_data():
         "date_str": date_str
     }
 
+
+# ---------------------------------------------------------
+# 1. חיפוש כללי באינטרנט (24 שעות אחרונות) - במקום מיכה סטוקס
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 1. חיפוש כללי באינטרנט (24 שעות אחרונות) - במקום מיכה סטוקס
+# ---------------------------------------------------------
+
+def fetch_daily_market_news_from_rss() -> str:
+    logger.info("📡 Fetching latest 24h market news via Google News RSS...")
+
+    # רשימת מילות מפתח ומדדים מרכזיים לסריקה
+    queries = ["SPY stock", "QQQ stock", "Bitcoin crypto market", "Nvidia Tesla stock news"]
+    all_headlines = []
+
+    for query in queries:
+        try:
+            # חיפוש ממוקד ל-24 השעות האחרונות (when:1d)
+            encoded_query = query.replace(" ", "+")
+            url = f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl=en-US&gl=US&ceid=US:en"
+
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                xml_data = resp.read()
+                root = ET.fromstring(xml_data)
+
+                # שליפת 3 הכותרות המובילות לכל שאילתת חיפוש
+                for item in root.findall(".//item")[:3]:
+                    title = item.findtext("title") or ""
+                    if " - " in title:
+                        title = title.rsplit(" - ", 1)[0]  # הסרת שם מקור החדשות בסוף הכותרת
+                    if title not in all_headlines:
+                        all_headlines.append(title)
+        except Exception as e:
+            logger.warning(f"Failed pulling RSS for query '{query}': {e}")
+
+    # גיבוש כל הכותרות למסמך טקסט קצר ונקי
+    market_summary = "Latest 24h Market Headlines & Catalysts:\n" + "\n".join([f"- {h}" for h in all_headlines])
+    logger.info(f"✅ Extracted {len(all_headlines)} clean headlines from RSS.")
+    return market_summary
+
+
+# ---------------------------------------------------------
+# 2. חילוץ ואימות טיקרים מתוך סיכום הרשת
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 2. Market Data Verification
+# ---------------------------------------------------------
+def extract_and_verify_ticker_data(market_summary: str) -> dict:
+    logger.info("🔍 Extracting mentioned tickers from web summary and fetching ground-truth data...")
+    client = get_gemini_client()
+
+    prompt = f"Extract all stock tickers mentioned in this market summary as a JSON array of strings (e.g. ['NVDA', 'TSLA', 'AAPL']): {market_summary}"
+    res = client.models.generate_content(model="gemini-flash-lite-latest", contents=prompt)
+    tickers = []
+    try:
+        tickers = json.loads(re.search(r'\[.*\]', res.text, re.DOTALL).group(0))
+    except Exception:
+        tickers = ["NVDA", "TSLA", "AAPL", "MSFT"]
+
+    verified_data = {}
+    for ticker in set(tickers):
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="5d")
+            if not hist.empty:
+                last_close = float(hist['Close'].iloc[-1])
+                prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else last_close
+                pct_change = ((last_close - prev_close) / prev_close) * 100
+                verified_data[ticker] = {
+                    "price": round(last_close, 2),
+                    "pct_change": round(pct_change, 2)
+                }
+        except Exception as e:
+            logger.warning(f"Failed to fetch market data for {ticker}: {e}")
+
+    return verified_data
+
+
+# ---------------------------------------------------------
+# 3. יצירת תסריט מבוסס נתוני רשת ואימות שוק
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 3. AI Script Generation with Structured Schema
+# ---------------------------------------------------------
+def generate_verified_script(market_summary: str, verified_market_data: dict) -> FullVideoScriptSchema:
+    logger.info("Generating structured video script from web insights and verified data...")
+    client = get_gemini_client()
+
+    prompt = f"""
+    You are a top-tier Wall Street video producer and YouTube Shorts retention strategist.
+    Synthesize this web market summary (from the last 24 hours) and VERIFIED market data into an English script for short-form video.
+
+    Web Market Summary:
+    {market_summary}
+
+    Verified Market Data (MUST USE THESE EXACT NUMBERS):
+    {json.dumps(verified_market_data, indent=2)}
+
+    CRITICAL SCRIPTING & CTA RULES:
+    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK (STRICTLY 15 TO 25 WORDS, ~5-7 SECONDS). 
+       - Focus ONLY on the single biggest market shock, catalyst, or extreme price move across QQQ, SPY, or BTC today.
+       - Use high-impact, dramatic trigger words.
+    2. "analyzed_stocks": Max 4 key stocks from the summary. Provide exact technical key levels.
+       - Explain WHAT is expected to happen when price reaches those key levels.
+    3. ABSOLUTELY NO EMOJIS in any field.
+    """
+
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=FullVideoScriptSchema
+        )
+    )
+    return FullVideoScriptSchema.model_validate_json(response.text)
+
+# ---------------------------------------------------------
+# 4. עדכון ה-Pipeline המרכזי להרצה עצמאית
+# ---------------------------------------------------------
+def run_perfect_pipeline(
+        output_filename="perfect_daily_recap.mp4",
+        bg_music_path="assets/weekly_recup_music.mp3",
+        upload=False
+):
+    logger.info("🚀 Launching Independent Daily Video Pipeline (Web Search Mode)...")
+    temp_files = []
+    timestamps = []
+    current_time = 0.0
+
+    try:
+        # === חלק 1: חיפוש כללי באינטרנט על 24 השעות האחרונות ===
+        market_summary = fetch_daily_market_news_from_rss()
+
+        # === חלק 2: אימות נתוני שוק ===
+        verified_data = extract_and_verify_ticker_data(market_summary)
+
+        # === חלק 3: יצירת תסריט וכותרות ב-LLM מתוך הסיכום הכללי ===
+        script_schema = generate_verified_script(market_summary, verified_data)
+
+        # === חלק 4: רינדור אינטרו (גרף מדדים קפוא לאחר 7 שניות) ===
+        intro_audio_file = "temp_intro.mp3"
+        intro_duration = generate_voiceover_audio(script_schema.intro_script, intro_audio_file)
+        temp_files.append(intro_audio_file)
+
+        market_data = fetch_intro_index_data()
+        intro_clip = render_dynamic_intro_clip(market_data, intro_audio_file, intro_duration)
+        intro_clip = add_subtitles(intro_clip, script_schema.intro_script)
+
+        timestamps.append(f"{format_seconds_to_timestamp(current_time)} Market Overview")
+        current_time += intro_duration
+
+        # === חלק 5: רינדור סקציות המניות לפי קונטקסט ===
+        stock_clips = []
+        for stock_info in script_schema.analyzed_stocks:
+            stock_audio_file = f"temp_{stock_info.ticker}.mp3"
+            stock_duration = generate_voiceover_audio(stock_info.script, stock_audio_file)
+            temp_files.append(stock_audio_file)
+
+            verified_price = verified_data.get(stock_info.ticker, {}).get("price", 0.0)
+            s_clip = render_annotated_stock_clip(stock_info, verified_price, stock_audio_file, stock_duration)
+            s_clip = add_subtitles(s_clip, stock_info.script)
+            stock_clips.append(s_clip)
+
+            timestamps.append(f"{format_seconds_to_timestamp(current_time)} {stock_info.ticker}")
+            current_time += stock_duration
+
+        # === חלק 6: רינדור Outro וchapters ===
+        outro_clip = render_outro_clip(duration=5.0)
+        timestamps.append(f"{format_seconds_to_timestamp(current_time)} Outro")
+
+        chapters_text = "\n\nCHAPTERS:\n" + "\n".join(timestamps)
+        final_description = (script_schema.description + chapters_text).strip()
+
+        # === חלק 7: איחוד והפקת סרטון סופי ===
+        final_video = concatenate_videoclips([intro_clip] + stock_clips + [outro_clip])
+
+        if bg_music_path and os.path.exists(bg_music_path):
+            logger.info("🎵 Mixing background music...")
+            bg_music = AudioFileClip(bg_music_path)
+            if bg_music.duration < final_video.duration:
+                bg_music = bg_music.with_effects([afx.AudioLoop(duration=final_video.duration)])
+            else:
+                bg_music = bg_music.subclipped(0, final_video.duration)
+            bg_music = bg_music.with_effects([
+                afx.MultiplyVolume(0.12),
+                afx.AudioFadeOut(2.0)
+            ])
+            final_video = final_video.with_audio(CompositeAudioClip([final_video.audio, bg_music]))
+
+        logger.info(f"💾 Rendering final video file: {output_filename}...")
+        final_video.write_videofile(
+            output_filename,
+            fps=30,
+            codec="libx264",
+            audio_codec="aac",
+            bitrate="8000k",
+            logger=None,
+            threads=1,
+            preset="ultrafast"
+        )
+
+        # === חלק 8: Thumbnail והעלאה ליוטיוב ===
+        img_path = None
+        if callable(generate_daily_thumbnail):
+            try:
+                img_path = generate_daily_thumbnail(
+                    sp500_val=float(market_data["SPY"][1]),
+                    sp500_pct=float(market_data["SPY"][0][-1]),
+                    qqq_val=float(market_data["QQQ"][1]),
+                    qqq_pct=float(market_data["QQQ"][0][-1]),
+                    btc_val=float(market_data["BTC"][1]),
+                    btc_pct=float(market_data["BTC"][0][-1]),
+                    date_str=market_data.get("date_str"),
+                    template_path="assets/Thumbnail_Daily.jpg",
+                    output_path="d_thumbnail.png",
+                )
+            except Exception as e:
+                logger.error(f"⚠️ Thumbnail generation failed: {e}")
+
+        if upload and callable(upload_video):
+            logger.info("🚀 Uploading video to YouTube...")
+            upload_video(
+                file_path=output_filename,
+                title=script_schema.youtube_title,
+                description=final_description,
+                tags=script_schema.tags,
+                thumbnail_path=img_path
+            )
+
+        logger.info("✅ Pipeline executed successfully (Independent Mode)!")
+        return output_filename
+
+    finally:
+        logger.info("🧹 Cleaning up temporary files...")
+        for tmp in temp_files:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file {tmp}: {e}")
 
 def render_outro_clip(duration: float = 5.0) -> VideoClip:
     logger.info("Rendering Outro Screen with CTA...")
@@ -685,144 +663,5 @@ def add_subtitles(video_clip: VideoClip, text: str) -> CompositeVideoClip:
 
     return CompositeVideoClip(subtitle_clips)
 
-
-def run_perfect_pipeline(
-        output_filename="perfect_daily_recap.mp4",
-        bg_music_path="assets/weekly_recup_music.mp3",
-        upload=False
-):
-    logger.info("🚀 Launching Perfect Daily Video Pipeline...")
-    temp_files = []
-    timestamps = []
-    current_time = 0.0
-
-    try:
-        # === חלק 1: חילוץ ותמלול ===
-        video_url = get_latest_micha_video_url()
-        if not video_url:
-            raise ValueError("Could not retrieve YouTube video URL from RSS.")
-
-        video_id = extract_video_id(video_url)
-        transcript = fetch_youtube_transcript_robust(video_id) if video_id else None
-
-        if not transcript:
-            logger.warning("Direct transcript unavailable. Attempting audio fallback...")
-            audio_mp3 = download_youtube_audio_fallback(video_url)
-            temp_files.append(audio_mp3)
-            transcript = transcribe_audio_with_gemini(audio_mp3)
-
-        # === חלק 2: אימות נתוני שוק ===
-        verified_data = extract_and_verify_ticker_data(transcript)
-
-        # === חלק 3: יצירת תסריט וכותרות ב-LLM ===
-        script_schema = generate_verified_script(transcript, verified_data)
-
-        # === חלק 4: רינדור אקרו/אינטרו ===
-        intro_audio_file = "temp_intro.mp3"
-        intro_duration = generate_voiceover_audio(script_schema.intro_script, intro_audio_file)
-        temp_files.append(intro_audio_file)
-
-        market_data = fetch_intro_index_data()
-        intro_clip = render_dynamic_intro_clip(market_data, intro_audio_file, intro_duration)
-        intro_clip = add_subtitles(intro_clip, script_schema.intro_script)
-
-        timestamps.append(f"{format_seconds_to_timestamp(current_time)} Market Overview")
-        current_time += intro_duration
-
-        # === חלק 5: רינדור סקציות המניות ===
-        stock_clips = []
-        for stock_info in script_schema.analyzed_stocks:
-            stock_audio_file = f"temp_{stock_info.ticker}.mp3"
-            stock_duration = generate_voiceover_audio(stock_info.script, stock_audio_file)
-            temp_files.append(stock_audio_file)
-
-            verified_price = verified_data.get(stock_info.ticker, {}).get("price", 0.0)
-            s_clip = render_annotated_stock_clip(stock_info, verified_price, stock_audio_file, stock_duration)
-            s_clip = add_subtitles(s_clip, stock_info.script)
-            stock_clips.append(s_clip)
-
-            timestamps.append(f"{format_seconds_to_timestamp(current_time)} {stock_info.ticker}")
-            current_time += stock_duration
-
-        # === חלק 6: רינדור Outro ורישום Chapters ===
-        outro_clip = render_outro_clip(duration=5.0)
-        timestamps.append(f"{format_seconds_to_timestamp(current_time)} Outro")
-
-        # יצירת תיאור סופי ל-YouTube כולל Chapters
-        chapters_text = "\n\nCHAPTERS:\n" + "\n".join(timestamps)
-        final_description = (script_schema.description + chapters_text).strip()
-
-        # === חלק 7: איחוד קטעי הוידאו ===
-        final_video = concatenate_videoclips([intro_clip] + stock_clips + [outro_clip])
-
-        # === חלק 8: מוזיקת רקע (MoviePy 2.x) ===
-        if bg_music_path and os.path.exists(bg_music_path):
-            logger.info("🎵 Mixing background music...")
-            bg_music = AudioFileClip(bg_music_path)
-
-            if bg_music.duration < final_video.duration:
-                bg_music = bg_music.with_effects([afx.AudioLoop(duration=final_video.duration)])
-            else:
-                bg_music = bg_music.subclipped(0, final_video.duration)
-
-            bg_music = bg_music.with_effects([
-                afx.MultiplyVolume(0.12),
-                afx.AudioFadeOut(2.0)
-            ])
-
-            final_video = final_video.with_audio(CompositeAudioClip([final_video.audio, bg_music]))
-
-        # === חלק 9: רינדור קובץ הווידאו הסופי ===
-        logger.info(f"💾 Rendering final video file: {output_filename}...")
-        final_video.write_videofile(
-            output_filename,
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            bitrate="8000k",
-            logger=None,
-            threads=1,
-            preset="ultrafast"
-        )
-
-        # === חלק 10: יצירת Thumbnail דינמי והעלאה ל-YouTube ===
-        img_path = None
-        if callable(generate_daily_thumbnail):
-            try:
-                img_path = generate_daily_thumbnail(
-                    sp500_val=float(market_data["SPY"][1]),
-                    sp500_pct=float(market_data["SPY"][0][-1]),
-                    qqq_val=float(market_data["QQQ"][1]),
-                    qqq_pct=float(market_data["QQQ"][0][-1]),
-                    btc_val=float(market_data["BTC"][1]),
-                    btc_pct=float(market_data["BTC"][0][-1]),
-                    date_str=market_data.get("date_str"),
-                    template_path="assets/Thumbnail_Daily.jpg",
-                    output_path="d_thumbnail.png",
-                )
-            except Exception as e:
-                logger.error(f"⚠️ Thumbnail generation failed: {e}")
-
-        if upload and callable(upload_video):
-            logger.info("🚀 Uploading video to YouTube...")
-            upload_video(
-                file_path=output_filename,
-                title=script_schema.youtube_title,
-                description=final_description,
-                tags=script_schema.tags,
-                thumbnail_path=img_path
-            )
-
-        logger.info("✅ Pipeline executed successfully!")
-        return output_filename
-
-    finally:
-        logger.info("🧹 Cleaning up temporary audio/script files...")
-        for tmp in temp_files:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception as e:
-                    logger.warning(f"Failed to remove temp file {tmp}: {e}")
 if __name__ == "__main__":
     run_perfect_pipeline()
