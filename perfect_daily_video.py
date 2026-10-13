@@ -45,9 +45,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("PerfectDailyVideo")
-logger.info(f"--- DIAGNOSTIC ---")
-logger.info(f"edge-tts version: {getattr(edge_tts, '__version__', 'unknown')}")
-logger.info(f"aiohttp version: {aiohttp.__version__}")
+edge_tts.constants.DEFAULT_HEADERS["User-Agent"] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+)
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # ---------------------------------------------------------
