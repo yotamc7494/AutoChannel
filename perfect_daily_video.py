@@ -6,14 +6,12 @@ import logging
 import asyncio
 import json
 import re
-import time
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 from uploader import upload_video
 from thumbnail import generate_daily_thumbnail
 import numpy as np
-import concurrent.futures
 import yfinance as yf
 from scipy.interpolate import make_interp_spline
 import matplotlib.pyplot as plt
@@ -47,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger("PerfectDailyVideo")
 _orig_ws_connect = aiohttp.ClientSession.ws_connect
 
-async def _patched_ws_connect(self, url, *args, **kwargs):
+def _patched_ws_connect(self, url, *args, **kwargs):
     headers = kwargs.get("headers", {})
     if isinstance(headers, dict):
         headers["User-Agent"] = (
@@ -56,7 +54,7 @@ async def _patched_ws_connect(self, url, *args, **kwargs):
             "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
         )
     kwargs["headers"] = headers
-    return await _orig_ws_connect(self, url, *args, **kwargs)
+    return _orig_ws_connect(self, url, *args, **kwargs)
 
 aiohttp.ClientSession.ws_connect = _patched_ws_connect
 GEMINI_MODEL = "gemini-flash-lite-latest"
