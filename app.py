@@ -38,8 +38,9 @@ if "WEBHOOK_TOKEN" in st.query_params:
             run_perfect_pipeline(output_filename=filename, upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
         elif video_type == "ping":
-            print("Wakeup", flush=True)
-            logging.info("🟢 Wakeup ping executed successfully!")
+            print("🟢 Wakeup print executed!", file=sys.stderr, flush=True)
+            logger.info("🟢 Wakeup ping executed successfully!")
+            logger.error("🟢 (Test Error Level) Wakeup ping executed!")
             sys.stdout.flush()
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
             st.stop()
