@@ -35,9 +35,7 @@ logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 load_dotenv()
 import aiohttp
 
-logger.info(f"--- DIAGNOSTIC ---")
-logger.info(f"edge-tts version: {getattr(edge_tts, '__version__', 'unknown')}")
-logger.info(f"aiohttp version: {aiohttp.__version__}")
+
 # ---------------------------------------------------------
 # Logging Setup
 # ---------------------------------------------------------
@@ -47,6 +45,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("PerfectDailyVideo")
+logger.info(f"--- DIAGNOSTIC ---")
+logger.info(f"edge-tts version: {getattr(edge_tts, '__version__', 'unknown')}")
+logger.info(f"aiohttp version: {aiohttp.__version__}")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # ---------------------------------------------------------
