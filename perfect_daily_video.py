@@ -59,7 +59,7 @@ async def _patched_ws_connect(self, url, *args, **kwargs):
     return await _orig_ws_connect(self, url, *args, **kwargs)
 
 aiohttp.ClientSession.ws_connect = _patched_ws_connect
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-flash-lite-latest"
 
 # ---------------------------------------------------------
 # Pydantic Schemas for Structured LLM Output
