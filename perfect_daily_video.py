@@ -469,6 +469,7 @@ def run_perfect_pipeline(
             audio_codec="aac",
             bitrate="8000k",
             threads=8,
+            logger=None,
             preset="ultrafast"
         )
 
