@@ -366,7 +366,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK (15 TO 25 WORDS).
     2. "news_ticker_text": Generate 3 high-impact breaking news headlines with ultra-short descriptions, separated by ' • '. Keep text uppercase and ultra punchy for top scrolling ticker.
     3. "analyzed_stocks": Max 4 key stocks with precise key levels.
-    4. ABSOLUTELY NO EMOJIS in any field.
+    4. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field.
     """
 
     response = ask_llm(prompt, config=types.GenerateContentConfig(
