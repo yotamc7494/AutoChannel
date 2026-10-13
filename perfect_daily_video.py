@@ -98,8 +98,7 @@ def clean_script_for_tts(text: str) -> str:
 def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.mp3") -> float:
     clean_text = clean_script_for_tts(script_text)
     logger.info(f"Generating TTS audio: {output_path}")
-    clean_text = "This is a simple test script to check if edge tts works."
-
+    time.sleep(1.5)
     async def _save():
         voice = "en-GB-RyanNeural"
         communicate = edge_tts.Communicate(clean_text, voice, rate="+15%")
