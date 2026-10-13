@@ -40,6 +40,7 @@ if "WEBHOOK_TOKEN" in st.query_params:
         elif video_type == "ping":
             print("Wakeup", flush=True)
             logging.info("🟢 Wakeup ping executed successfully!")
+            sys.stdout.flush()
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
             st.stop()
     else:
