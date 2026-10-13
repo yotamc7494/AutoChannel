@@ -43,7 +43,6 @@ if "WEBHOOK_TOKEN" in st.query_params:
             logger.error("🟢 (Test Error Level) Wakeup ping executed!")
             sys.stdout.flush()
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
-            st.stop()
     else:
         st.info("Wrong Token!")
 
