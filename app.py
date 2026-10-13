@@ -10,50 +10,58 @@ try:
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
+
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
 from daily_recap_generator import build_full_daily_video
 from weekly_summery_video import generate_and_upload_video
 from streamlit.logger import get_logger
-# ייבוא המנוע היומי המשודרג (החדש)
 from perfect_daily_video import run_perfect_pipeline
+
 logger = get_logger(__name__)
+
 st.set_page_config(page_title="AI Stock Video Generator", page_icon="🚀")
+
+# הדפסה מיידית ללוג השרת עם טעינת הדף
 print("🚀 [APP START] Executing app.py", file=sys.stderr, flush=True)
-st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
-# --- תמיכה ב-Webhook מ-GitHub Actions ---
-if "WEBHOOK_TOKEN" in st.query_params:
-    if st.query_params["WEBHOOK_TOKEN"] == st.secrets.get("WEBHOOK_TOKEN"):
-        video_type = st.query_params["video_type"]
-        print(f"⚡ Webhook triggered from GitHub Actions! - {video_type}", flush=True)
-        sys.stdout.reconfigure(line_buffering=True)
-        
+
+# --- תמיכה ב-Webhook מ-GitHub Actions / Ping ---
+query_params = st.query_params
+if "WEBHOOK_TOKEN" in query_params:
+    if query_params.get("WEBHOOK_TOKEN") == st.secrets.get("WEBHOOK_TOKEN"):
+        video_type = query_params.get("video_type")
+        print(f"⚡ Webhook triggered: {video_type}", file=sys.stderr, flush=True)
+
         if video_type == "update_video":
             filename = render_final_video()
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            st.stop()
         elif video_type == "vs_video":
             filename = run_generator()
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            st.stop()
         elif video_type == "weekly_summery":
             filename = generate_and_upload_video(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            st.stop()
         elif video_type == "daily_summery":
-            # הפעלת הפייפליין המשודרג
             filename = "perfect_daily_recap.mp4"
             run_perfect_pipeline(output_filename=filename, upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            st.stop()
         elif video_type == "ping":
-            # 1. כתיבה ל-Logger הרשמי ברמת WARNING/ERROR (נכתב ישר ללוגים)
             logger.warning("🟢 [PING] Keep-Alive Ping Received!")
-
-            # 2. כתיבה ל-stderr עם מילוי רווחים המפנה את ה-Buffer של ה-Container מיד
-            print("🟢 [PING] Server is awake!" + " " * 4096, file=sys.stderr, flush=True)
-
+            print("🟢 [PING] Server is awake and ready!", file=sys.stderr, flush=True)
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
             st.stop()
     else:
         st.info("Wrong Token!")
+
+# =========================================================
+# ממשק המשתמש הרגיל של האפליקציה
+# =========================================================
+st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
 
 # ---------------------------------------------------------
 # סקשן 1: סרטוני מנייה
@@ -130,7 +138,7 @@ if run_full_weekly or run_test_weekly:
     is_test_mode_w = run_test_weekly
     st.info(f"מריץ סרטון סיכום שבועי (מצב טסט: {is_test_mode_w})...")
     video_path = generate_and_upload_video(upload=not is_test_mode_w)
-    
+
     if video_path and os.path.exists(video_path):
         with open(video_path, "rb") as file:
             video_bytes = file.read()
@@ -160,7 +168,7 @@ if run_full_weekly or run_test_weekly:
 st.write("---")
 
 # ---------------------------------------------------------
-# סקשן 4: סרטוני סיכום יומי (הגרסה המשודרגת 6/6)
+# סקשן 4: סרטוני סיכום יומי (הגרסה המשודרגת)
 # ---------------------------------------------------------
 st.header("סרטוני סיכום יומי (משודרג)")
 col7, col8 = st.columns(2)
@@ -173,17 +181,15 @@ with col8:
 if run_full_daily or run_test_daily:
     is_test_mode_d = run_test_daily
     st.info("🔄 מתחיל ביצירת סרטון סיכום יומי (פייפליין 6 השלבים)...")
-    
+
     output_file = "perfect_daily_recap.mp4"
-    
+
     with st.spinner("מוריד תמלול, מאמת נתונים, מפיק TTS ומקליט וידאו..."):
         try:
-            # הפעלת הפייפליין החדש
             run_perfect_pipeline(output_filename=output_file, upload=run_full_daily)
             st.success("🎉 סרטון הסיכום היומי נוצר בהצלחה!")
-            
+
             if os.path.exists(output_file) and is_test_mode_d:
-                # 1. המרה ל-Base64 והורדה אוטומטית בדפדפן
                 with open(output_file, "rb") as file:
                     video_bytes = file.read()
 
@@ -202,10 +208,8 @@ if run_full_daily or run_test_daily:
                 """
                 components.html(download_js, height=0, width=0)
 
-                # 2. נגן וידאו מובנה לתצוגה מקדימה ב-Streamlit
                 st.video(video_bytes)
 
-                # 3. לחצן גיבוי להורדה ידנית
                 st.download_button(
                     label="📥 לחץ כאן להורדת סרטון הסיכום היומי (MP4)",
                     data=video_bytes,
