@@ -20,7 +20,7 @@ from streamlit.logger import get_logger
 from perfect_daily_video import run_perfect_pipeline
 logger = get_logger(__name__)
 st.set_page_config(page_title="AI Stock Video Generator", page_icon="🚀")
-
+print("🚀 [APP START] Executing app.py", file=sys.stderr, flush=True)
 st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
 # --- תמיכה ב-Webhook מ-GitHub Actions ---
 if "WEBHOOK_TOKEN" in st.query_params:
