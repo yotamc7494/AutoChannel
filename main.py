@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use('Agg')  # חובה להופיע לפני היבוא של pyplot!
 import matplotlib.pyplot as plt
 import yfinance as yf
-import edge_tts
 import whisper
 import shutil
 from dotenv import load_dotenv
@@ -21,7 +20,12 @@ from PIL import Image, ImageDraw, ImageFont
 from google import genai
 from google.genai import types
 from upstash_redis import Redis
+import asyncio
+import logging
+import requests
+import edge_tts
 
+logger = logging.getLogger(__name__)
 from moviepy import (
     AudioFileClip, ImageClip, VideoClip, CompositeVideoClip, VideoFileClip
 )
@@ -399,10 +403,44 @@ def generate_script_and_titles_with_ai(stock_data):
 # -----------------------------------------------------------------------------
 # 3. קריינות + חילוץ כתוביות בעזרת Whisper
 # -----------------------------------------------------------------------------
-async def create_tts_async(text, audio_file="voiceover.mp3"):
-    voice = "en-GB-RyanNeural"
-    communicate = edge_tts.Communicate(text, voice, rate="+15%")
-    await communicate.save(audio_file)
+def fetch_free_proxies():
+    """שולף רשימת פרוקסים חינמיים מעודכנת בזמן אמת"""
+    try:
+        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2500&country=all&ssl=all&anonymity=all"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            return [p.strip() for p in response.text.splitlines() if p.strip()]
+    except Exception as e:
+        logger.warning(f"Could not fetch proxy list: {e}")
+    return []
+
+
+async def create_tts_async(text: str, audio_file: str = "voiceover.mp3", voice: str = "en-GB-RyanNeural",
+                           rate: str = "+15%"):
+    # 1. ניסיון ראשון: חיבור ישיר
+    try:
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        await communicate.save(audio_file)
+        return
+    except Exception as e:
+        logger.warning(f"Direct TTS failed (403 AWS Block), switching to auto-proxy fallback... Error: {e}")
+
+    # 2. ניסיון משני: שליפת פרוקסים חינמיים והרצה דרכם
+    proxies = fetch_free_proxies()
+
+    for proxy_ip in proxies[:15]:  # מנסה עד 15 פרוקסים מהרשימה
+        proxy_url = f"http://{proxy_ip}"
+        try:
+            logger.info(f"Attempting TTS via proxy: {proxy_url}")
+            communicate = edge_tts.Communicate(text, voice, rate=rate, proxy=proxy_url)
+            await communicate.save(audio_file)
+            logger.info(f"✅ TTS generated successfully via proxy: {proxy_url}")
+            return
+        except Exception:
+            continue  # אם הפרוקסי הספציפי איטי/נכשל, עוברים הבא בתור
+
+    raise RuntimeError("All proxy attempts failed. Could not bypass Bing 403 block.")
+
 
 def get_exact_captions_with_whisper(audio_file, words_per_caption=2):
     print("🎧 Aligning captions directly from audio stream with Whisper...", flush=True)
