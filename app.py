@@ -12,7 +12,7 @@ from weekly_summery_video import generate_and_upload_video
 
 # ייבוא המנוע היומי המשודרג (החדש)
 from perfect_daily_video import run_perfect_pipeline
-logging.basicConfig(level=logging.INFO)
+logger = get_logger(__name__)
 st.set_page_config(page_title="AI Stock Video Generator", page_icon="🚀")
 
 st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
