@@ -51,6 +51,7 @@ if "WEBHOOK_TOKEN" in st.query_params:
             print("🟢 [PING] Server is awake!" + " " * 4096, file=sys.stderr, flush=True)
 
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
+            st.stop()
     else:
         st.info("Wrong Token!")
 
