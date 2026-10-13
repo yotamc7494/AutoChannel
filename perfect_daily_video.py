@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from uploader import upload_video
 from thumbnail import generate_daily_thumbnail
 import numpy as np
+import concurrent.futures
 import pandas as pd
 import yfinance as yf
 from scipy.interpolate import make_interp_spline
@@ -102,7 +103,10 @@ def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.m
         comm = edge_tts.Communicate(clean_text, "en-US-ChristopherNeural", rate="+5%")
         await comm.save(output_path)
 
-    asyncio.run(_save())
+    # הרצה ב-Thread נפרד כדי להימנע מהתנגשות עם ה-Event Loop של Streamlit
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        executor.submit(asyncio.run, _save()).result()
+
     audio_clip = AudioFileClip(output_path)
     duration = audio_clip.duration
     audio_clip.close()
