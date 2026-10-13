@@ -428,7 +428,7 @@ async def create_tts_async(text: str, audio_file: str = "voiceover.mp3", voice: 
     # 2. ניסיון משני: שליפת פרוקסים חינמיים והרצה דרכם
     proxies = fetch_free_proxies()
 
-    for proxy_ip in proxies[:15]:  # מנסה עד 15 פרוקסים מהרשימה
+    for proxy_ip in proxies:  # מנסה עד 15 פרוקסים מהרשימה
         proxy_url = f"http://{proxy_ip}"
         try:
             logger.info(f"Attempting TTS via proxy: {proxy_url}")

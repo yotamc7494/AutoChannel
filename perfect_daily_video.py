@@ -122,7 +122,7 @@ def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.m
 
         # 2. ניסיון דרך רשימת פרוקסים חינמיים
         proxies = fetch_free_proxies()
-        for proxy_ip in proxies[:15]:
+        for proxy_ip in proxies:
             proxy_url = f"http://{proxy_ip}"
             try:
                 logger.info(f"Attempting TTS via proxy: {proxy_url}")
