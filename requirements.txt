@@ -2,7 +2,7 @@ requests
 youtube-transcript-api
 streamlit
 yfinance
-edge-tts>=6.1.12
+edge-tts>=7.2.7
 openai-whisper
 matplotlib
 numpy
