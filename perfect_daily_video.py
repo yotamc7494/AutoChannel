@@ -43,20 +43,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("PerfectDailyVideo")
-_orig_ws_connect = aiohttp.ClientSession.ws_connect
-
-def _patched_ws_connect(self, url, *args, **kwargs):
-    headers = kwargs.get("headers", {})
-    if isinstance(headers, dict):
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
-        )
-    kwargs["headers"] = headers
-    return _orig_ws_connect(self, url, *args, **kwargs)
-
-aiohttp.ClientSession.ws_connect = _patched_ws_connect
 GEMINI_MODEL = "gemini-flash-lite-latest"
 
 # ---------------------------------------------------------
@@ -110,7 +96,7 @@ def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.m
     clean_text = clean_script_for_tts(script_text)
 
     logger.info(f"Generating TTS audio: {output_path}")
-
+    time.sleep(2)
 
 
     async def _save():
