@@ -1,3 +1,4 @@
+import edge_tts
 import os
 os.environ["IMAGEMAGICK_BINARY"] = "/usr/bin/convert"
 import sys
@@ -13,17 +14,12 @@ from uploader import upload_video
 from thumbnail import generate_daily_thumbnail
 import numpy as np
 import concurrent.futures
-import pandas as pd
 import yfinance as yf
 from scipy.interpolate import make_interp_spline
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-import edge_tts
 from google import genai
 from google.genai import types
-import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-import requests
 from moviepy import (
     AudioFileClip,
     CompositeAudioClip,
@@ -37,7 +33,11 @@ import moviepy.audio.fx as afx
 from dotenv import load_dotenv
 logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 load_dotenv()
+import aiohttp
 
+logger.info(f"--- DIAGNOSTIC ---")
+logger.info(f"edge-tts version: {getattr(edge_tts, '__version__', 'unknown')}")
+logger.info(f"aiohttp version: {aiohttp.__version__}")
 # ---------------------------------------------------------
 # Logging Setup
 # ---------------------------------------------------------
