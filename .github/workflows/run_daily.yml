@@ -80,7 +80,7 @@ jobs:
                   video_type = 'vs_video'
 
           token = os.environ.get('WEBHOOK_TOKEN', '')
-          url = f'https://slack-ai-agent-xt3nrfdfzjxsupyxdlncnm.streamlit.app/?WEBHOOK_TOKEN={token}&video_type={video_type}'
+          url = f'https://autochannel-stockmarketnews.streamlit.app/?WEBHOOK_TOKEN={token}&video_type={video_type}'
           print(f'🚀 Opening {url} (Type: {video_type}) in Headless Chrome...')
 
           with sync_playwright() as p:
