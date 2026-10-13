@@ -92,28 +92,55 @@ def clean_script_for_tts(text: str) -> str:
         text = re.sub(pattern, replacement, text)
     return text
 
+def fetch_free_proxies():
+    """שולף רשימת פרוקסים חינמיים מעודכנת בזמן אמת"""
+    try:
+        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2500&country=all&ssl=all&anonymity=all"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            return [p.strip() for p in response.text.splitlines() if p.strip()]
+    except Exception as e:
+        logger.warning(f"Could not fetch proxy list: {e}")
+    return []
+
 def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.mp3") -> float:
-
     clean_text = clean_script_for_tts(script_text)
-
     logger.info(f"Generating TTS audio: {output_path}")
-    time.sleep(2)
-
 
     async def _save():
+        voice = "en-US-ChristopherNeural"
+        rate = "+5%"
 
-        comm = edge_tts.Communicate(clean_text, "en-US-ChristopherNeural", rate="+5%")
+        # 1. ניסיון חיבור ישיר
+        try:
+            comm = edge_tts.Communicate(clean_text, voice, rate=rate)
+            await comm.save(output_path)
+            return
+        except Exception as e:
+            logger.warning(f"Direct TTS failed ({e}), switching to proxy fallback...")
 
-        await comm.save(output_path)
+        # 2. ניסיון דרך רשימת פרוקסים חינמיים
+        proxies = fetch_free_proxies()
+        for proxy_ip in proxies[:15]:
+            proxy_url = f"http://{proxy_ip}"
+            try:
+                logger.info(f"Attempting TTS via proxy: {proxy_url}")
+                comm = edge_tts.Communicate(clean_text, voice, rate=rate, proxy=proxy_url)
+                await comm.save(output_path)
+                logger.info(f"✅ TTS generated successfully via proxy: {proxy_url}")
+                return
+            except Exception:
+                continue
 
+        raise RuntimeError("All proxy attempts failed for TTS.")
 
-
-    asyncio.run(_save())
+    # הרצה בתוך ThreadPoolExecutor למניעת התנגשות ב-Event Loop של Streamlit
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, _save())
+        future.result()
 
     audio_clip = AudioFileClip(output_path)
-
     duration = audio_clip.duration
-
     audio_clip.close()
 
     return duration
