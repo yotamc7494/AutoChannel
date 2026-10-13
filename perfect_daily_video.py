@@ -46,6 +46,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("PerfectDailyVideo")
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # ---------------------------------------------------------
 # Pydantic Schemas for Structured LLM Output
@@ -219,7 +220,7 @@ def extract_and_verify_ticker_data(market_summary: str) -> dict:
     client = get_gemini_client()
 
     prompt = f"Extract all stock tickers mentioned in this market summary as a JSON array of strings (e.g. ['NVDA', 'TSLA', 'AAPL']): {market_summary}"
-    res = client.models.generate_content(model="gemini-flash-lite-latest", contents=prompt)
+    res = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     tickers = []
     try:
         tickers = json.loads(re.search(r'\[.*\]', res.text, re.DOTALL).group(0))
@@ -275,7 +276,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     """
 
     response = client.models.generate_content(
-        model="gemini-flash-lite-latest",
+        model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -364,8 +365,7 @@ def run_perfect_pipeline(
             codec="libx264",
             audio_codec="aac",
             bitrate="8000k",
-            logger=None,
-            threads=1,
+            threads=8,
             preset="ultrafast"
         )
 
@@ -522,7 +522,7 @@ def render_annotated_stock_clip(stock_info: StockAnalysis, verified_price: float
 
     fig = plt.figure(figsize=(19.2, 10.8), dpi=100)
     canvas = FigureCanvasAgg(fig)
-
+    print(df)
     opens = np.asarray(df['Open'].values, dtype=float).flatten()
     closes = np.asarray(df['Close'].values, dtype=float).flatten()
     highs = np.asarray(df['High'].values, dtype=float).flatten()
