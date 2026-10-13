@@ -3,8 +3,6 @@ import os
 import sys
 import base64
 import streamlit.components.v1 as components
-import logging
-
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -14,7 +12,6 @@ except Exception:
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
-from daily_recap_generator import build_full_daily_video
 from weekly_summery_video import generate_and_upload_video
 from streamlit.logger import get_logger
 from perfect_daily_video import run_perfect_pipeline
@@ -61,84 +58,38 @@ if "WEBHOOK_TOKEN" in query_params:
 # =========================================================
 # ממשק המשתמש הרגיל של האפליקציה
 # =========================================================
-st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
+st.set_page_config(page_title="מחולל סרטוני מניות", page_icon="🚀", layout="centered")
+
+st.title("🚀 מחולל סרטוני מניות")
 
 # ---------------------------------------------------------
-# סקשן 1: סרטוני מנייה
+# 3 שדות קלט מרכזיים
 # ---------------------------------------------------------
-st.header("סרטוני מנייה")
+video_type = st.selectbox(
+    "🎬 בחר סוג סרטון:",
+    [
+        "סרטון מנייה",
+        "סרטון השוואה",
+        "סיכום שבועי",
+        "סיכום יומי (משודרג)"
+    ]
+)
+
 col1, col2 = st.columns(2)
-
 with col1:
-    run_full_stock = st.button("🚀 הרץ והעלה מנייה ליוטיוב", key="btn_stock_full")
+    is_test_mode = st.checkbox("🧪 מצב ניסיון (טסט בלבד)", value=True)
 with col2:
-    run_test_stock = st.button("🧪 הרצת ניסיון מנייה (תצוגה מקדימה)", key="btn_stock_test")
+    upload_to_yt = st.checkbox("🚀 העלאה ליוטיוב", value=not is_test_mode)
 
-if run_full_stock or run_test_stock:
-    if run_test_stock:
-        st.warning("🧪 מריץ במצב ניסיון: הסרטון לא יועלה ליוטיוב.")
-        filename = view_final_video()
-        st.success("✅ הסרטון נוצר בהצלחה!")
-        if filename and os.path.exists(filename):
-            with open(filename, "rb") as file:
-                st.download_button(
-                    label="📥 הורד את הסרטון למחשב",
-                    data=file,
-                    file_name=os.path.basename(filename),
-                    mime="video/mp4"
-                )
-        else:
-            st.error("שגיאה: קובץ הוידאו לא נמצא.")
-    else:
-        st.info("🚀 מריץ תהליך מלא כולל העלאה ליוטיוב...")
-        render_final_video()
-        st.success("התהליך הסתיים.")
+# אזהרת אינטראקציה בין מצב ניסיון להעלאה
+if is_test_mode and upload_to_yt:
+    st.warning("⚠️ שים לב: במצב ניסיון הסרטון לא יועלה ליוטיוב בפועל.")
 
-st.write("---")
 
 # ---------------------------------------------------------
-# סקשן 2: סרטוני השוואה
+# פונקציית עזר להצגת הווידאו והורדה אוטומטית / ידנית
 # ---------------------------------------------------------
-st.header("סרטוני השוואה")
-col3, col4 = st.columns(2)
-
-with col3:
-    run_full_comp = st.button("🚀 הרץ והעלה השוואה ליוטיוב", key="btn_comp_full")
-with col4:
-    run_test_comp = st.button("🧪 הרצת ניסיון השוואה (תצוגה מקדימה)", key="btn_comp_test")
-
-if run_full_comp or run_test_comp:
-    is_test_mode_c = run_test_comp
-    st.info(f"מריץ סרטון השוואה (מצב טסט: {is_test_mode_c})...")
-    video_path = run_generator(is_test_mode_c)
-    st.success("תהליך יצירת סרטון השוואה הסתיים.")
-    if video_path and os.path.exists(video_path):
-        with open(video_path, "rb") as file:
-            st.download_button(
-                label="📥 הורד את ההשוואה למחשב",
-                data=file,
-                file_name=os.path.basename(video_path),
-                mime="video/mp4"
-            )
-
-st.write("---")
-
-# ---------------------------------------------------------
-# סקשן 3: סרטוני סיכום שבועי
-# ---------------------------------------------------------
-st.header("סרטוני סיכום שבועי")
-col5, col6 = st.columns(2)
-
-with col5:
-    run_full_weekly = st.button("🚀 הרץ והעלה סיכום שבועי ליוטיוב", key="btn_weekly_full")
-with col6:
-    run_test_weekly = st.button("🧪 הרצת ניסיון סיכום שבועי (תצוגה מקדימה)", key="btn_weekly_test")
-
-if run_full_weekly or run_test_weekly:
-    is_test_mode_w = run_test_weekly
-    st.info(f"מריץ סרטון סיכום שבועי (מצב טסט: {is_test_mode_w})...")
-    video_path = generate_and_upload_video(upload=not is_test_mode_w)
-
+def display_and_download_video(video_path: str):
     if video_path and os.path.exists(video_path):
         with open(video_path, "rb") as file:
             video_bytes = file.read()
@@ -146,6 +97,7 @@ if run_full_weekly or run_test_weekly:
         b64_video = base64.b64encode(video_bytes).decode("utf-8")
         file_name = os.path.basename(video_path)
 
+        # סקריפט להורדה אוטומטית בדפדפן
         download_js = f"""
         <script>
             var a = document.createElement('a');
@@ -158,66 +110,55 @@ if run_full_weekly or run_test_weekly:
         """
         components.html(download_js, height=0, width=0)
 
+        # נגן ווידאו לתצוגה מקדימה
+        st.subheader("📺 תצוגה מקדימה:")
+        st.video(video_bytes)
+
+        # כפתור הורדה ידני כגבוי
         st.download_button(
-            label="📥 ההורדה לא התחילה? לחץ כאן להורדה ידנית",
+            label="📥 לחץ כאן להורדת הסרטון (MP4)",
             data=video_bytes,
             file_name=file_name,
             mime="video/mp4",
+            key="btn_download_video"
         )
+    else:
+        st.error("❌ הקובץ נוצר אך לא נמצא בדיסק.")
 
+
+# ---------------------------------------------------------
+# הרצת הפייפליין לפי בחירת המשתמש
+# ---------------------------------------------------------
 st.write("---")
+if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
+    should_upload = upload_to_yt and not is_test_mode
 
-# ---------------------------------------------------------
-# סקשן 4: סרטוני סיכום יומי (הגרסה המשודרגת)
-# ---------------------------------------------------------
-st.header("סרטוני סיכום יומי (משודרג)")
-col7, col8 = st.columns(2)
-
-with col7:
-    run_full_daily = st.button("🚀 הרץ והעלה סיכום יומי ליוטיוב", key="btn_daily_full")
-with col8:
-    run_test_daily = st.button("🧪 הרצת ניסיון סיכום יומי (תצוגה מקדימה)", key="btn_daily_test")
-
-if run_full_daily or run_test_daily:
-    is_test_mode_d = run_test_daily
-    st.info("🔄 מתחיל ביצירת סרטון סיכום יומי (פייפליין 6 השלבים)...")
-
-    output_file = "perfect_daily_recap.mp4"
-
-    with st.spinner("מוריד תמלול, מאמת נתונים, מפיק TTS ומקליט וידאו..."):
+    with st.spinner(f"⏳ מפיק סרטון {video_type}..."):
         try:
-            run_perfect_pipeline(output_filename=output_file, upload=run_full_daily)
-            st.success("🎉 סרטון הסיכום היומי נוצר בהצלחה!")
+            video_path = None
 
-            if os.path.exists(output_file) and is_test_mode_d:
-                with open(output_file, "rb") as file:
-                    video_bytes = file.read()
+            if video_type == "סרטון מנייה":
+                if is_test_mode:
+                    video_path = view_final_video()
+                else:
+                    render_final_video()
+                    video_path = "final_stock_video.mp4"  # נתב לפי הקובץ ש-render_final_video מייצרת
 
-                b64_video = base64.b64encode(video_bytes).decode("utf-8")
-                file_name = os.path.basename(output_file)
+            elif video_type == "סרטון השוואה":
+                video_path = run_generator(is_test_mode)
 
-                download_js = f"""
-                <script>
-                    var a = document.createElement('a');
-                    a.href = 'data:video/mp4;base64,{b64_video}';
-                    a.download = '{file_name}';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                </script>
-                """
-                components.html(download_js, height=0, width=0)
+            elif video_type == "סיכום שבועי":
+                video_path = generate_and_upload_video(upload=should_upload)
 
-                st.video(video_bytes)
+            elif video_type == "סיכום יומי (משודרג)":
+                output_file = "perfect_daily_recap.mp4"
+                run_perfect_pipeline(output_filename=output_file, upload=should_upload)
+                video_path = output_file
 
-                st.download_button(
-                    label="📥 לחץ כאן להורדת סרטון הסיכום היומי (MP4)",
-                    data=video_bytes,
-                    file_name=file_name,
-                    mime="video/mp4",
-                    key="btn_download_daily_recap"
-                )
-            else:
-                st.error("❌ הקובץ נוצר אך לא נמצא בדיסק.")
+            st.success(f"🎉 סרטון {video_type} נוצר בהצלחה!")
+
+            # הצגה והורדה
+            display_and_download_video(video_path)
+
         except Exception as e:
             st.error(f"❌ שגיאה במהלך יצירת הסרטון: {e}")
