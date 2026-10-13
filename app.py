@@ -3,7 +3,7 @@ import os
 import sys
 import base64
 import streamlit.components.v1 as components
-
+import logging
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
@@ -12,7 +12,13 @@ from weekly_summery_video import generate_and_upload_video
 
 # ייבוא המנוע היומי המשודרג (החדש)
 from perfect_daily_video import run_perfect_pipeline
-
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("App")
 st.set_page_config(page_title="AI Stock Video Generator", page_icon="🚀")
 
 st.title("🚀 מחולל סרטוני מניות - מעקף ידני")
@@ -39,6 +45,7 @@ if "WEBHOOK_TOKEN" in st.query_params:
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
         elif video_type == "ping":
             print("Wakeup", flush=True)
+            logger.info("Wakeup")
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
             st.stop()
     else:
