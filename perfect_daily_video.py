@@ -99,11 +99,19 @@ def generate_voiceover_audio(script_text: str, output_path: str = "temp_speech.m
     clean_text = clean_script_for_tts(script_text)
     logger.info(f"Generating TTS audio: {output_path}")
 
+    # הגדרת Proxy (למשל פרוקסי חינמי או שירות פרוקסי)
+    # פורמט: "http://user:pass@host:port" או "http://host:port"
+    PROXY_URL = "http://djcyukzf:t65azlwkub2t@p.webshare.io:80/"
+
     async def _save():
-        comm = edge_tts.Communicate(clean_text, "en-US-ChristopherNeural", rate="+5%")
+        comm = edge_tts.Communicate(
+            clean_text,
+            "en-US-ChristopherNeural",
+            rate="+5%",
+            proxy=PROXY_URL  # העברת הפרוקסי
+        )
         await comm.save(output_path)
 
-    # הרצה ב-Thread נפרד כדי להימנע מהתנגשות עם ה-Event Loop של Streamlit
     with concurrent.futures.ThreadPoolExecutor() as executor:
         executor.submit(asyncio.run, _save()).result()
 
