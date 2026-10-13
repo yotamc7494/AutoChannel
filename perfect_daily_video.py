@@ -4,8 +4,9 @@ os.environ["IMAGEMAGICK_BINARY"] = "/usr/bin/convert"
 import sys
 import logging
 import asyncio
+import concurrent.futures
 import json
-import time
+import requests
 import re
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
