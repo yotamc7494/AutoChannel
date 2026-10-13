@@ -4,6 +4,12 @@ import sys
 import base64
 import streamlit.components.v1 as components
 import logging
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
@@ -38,10 +44,12 @@ if "WEBHOOK_TOKEN" in st.query_params:
             run_perfect_pipeline(output_filename=filename, upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
         elif video_type == "ping":
-            print("🟢 Wakeup print executed!", file=sys.stderr, flush=True)
-            logger.info("🟢 Wakeup ping executed successfully!")
-            logger.error("🟢 (Test Error Level) Wakeup ping executed!")
-            sys.stdout.flush()
+            # 1. כתיבה ל-Logger הרשמי ברמת WARNING/ERROR (נכתב ישר ללוגים)
+            logger.warning("🟢 [PING] Keep-Alive Ping Received!")
+
+            # 2. כתיבה ל-stderr עם מילוי רווחים המפנה את ה-Buffer של ה-Container מיד
+            print("🟢 [PING] Server is awake!" + " " * 4096, file=sys.stderr, flush=True)
+
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
     else:
         st.info("Wrong Token!")
