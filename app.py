@@ -9,7 +9,7 @@ from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
 from daily_recap_generator import build_full_daily_video
 from weekly_summery_video import generate_and_upload_video
-
+from streamlit.logger import get_logger
 # ייבוא המנוע היומי המשודרג (החדש)
 from perfect_daily_video import run_perfect_pipeline
 logger = get_logger(__name__)
