@@ -74,8 +74,27 @@ MAX_PROXY_ATTEMPTS = 10
 PROXY_TIMEOUT_SEC = 15
 
 # --- Data ---
-RSS_QUERIES = ["SPY stock", "QQQ stock", "Bitcoin crypto market", "Nvidia Tesla stock news"]
-WATCHLIST_CANDIDATES = ["NVDA", "AAPL", "TSLA", "MSFT", "AMZN", "AMD", "META", "GOOGL", "PLTR", "MARA"]
+RSS_QUERIES = [
+    "SPY QQQ stock market rally crash Fed rates",
+    "S&P 500 Nasdaq stock market today close",
+    "Nvidia AMD TSMC AI chip stock news",
+    "Tesla Apple Microsoft Amazon Meta stock news",
+    "top stock gainers losers earnings surprise market news",
+    "Bitcoin crypto market price surge MicroStrategy Coinbase"
+]
+WATCHLIST_CANDIDATES = [
+    # Mega-Cap Tech (ענקיות הטכנולוגיה)
+    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA",
+
+    # Semiconductors & AI (שבבים ובינה מלאכותית)
+    "AMD", "AVGO", "TSM", "ARM", "MU", "SMCI",
+
+    # High-Beta & Retail Favorites (מניות מומנטום ומסחר ער)
+    "PLTR", "COIN", "MSTR", "MARA", "HOOD", "NFLX", "ORCL",
+
+    # Market Leaders & Heavyweights (ענקיות סקטוריאליות)
+    "LLY", "CRM", "DIS", "JPM", "BABA"
+]
 TTS_SYMBOL_NAMES = {
     r"\bNVDA\b": "Nvidia", r"\bTSLA\b": "Tesla", r"\bAAPL\b": "Apple", r"\bAMZN\b": "Amazon",
     r"\bMSFT\b": "Microsoft", r"\bGOOGL\b": "Google", r"\bMETA\b": "Meta", r"\bBTC\b": "Bitcoin",
