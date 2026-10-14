@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import requests
 import yfinance as yf
 from dotenv import load_dotenv
 from google import genai

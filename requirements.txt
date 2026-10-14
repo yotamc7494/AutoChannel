@@ -3,6 +3,7 @@ youtube-transcript-api
 streamlit
 yfinance
 edge-tts>=7.3.1
+piper-tts
 openai-whisper
 matplotlib
 numpy
