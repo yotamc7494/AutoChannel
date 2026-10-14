@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import asyncio
+import gc
 import concurrent.futures
 import json
 import logging
 import math
 import os
+import pickle
 import re
 import shutil
 import subprocess
@@ -11,29 +15,16 @@ import sys
 import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import yfinance as yf
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
-from matplotlib.ticker import FuncFormatter
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
-from scipy.interpolate import make_interp_spline
-import soundfile as sf
-from kokoro import KPipeline
-
-_kokoro_pipeline = None
-from uploader import upload_video
 
 load_dotenv()
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
@@ -52,12 +43,17 @@ logger = logging.getLogger("PerfectDailyShorts")
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"]  # tried in order
 
 # --- Video (9:16 vertical, YouTube Shorts) ---
-VIDEO_W, VIDEO_H = 1080, 1920          # drop to 720x1280 for ~2x faster renders (VIDEO_H must stay 16/9 * VIDEO_W)
+# Low-RAM Streamlit default (2.25x fewer pixels than 1080x1920).
+# Set PERFECT_VIDEO_WIDTH=1080 to restore the original resolution if RAM allows.
+VIDEO_W = int(os.environ.get("PERFECT_VIDEO_WIDTH", "720"))
+if VIDEO_W not in (540, 720, 1080):
+    raise ValueError("PERFECT_VIDEO_WIDTH must be 540, 720 or 1080")
+VIDEO_H = VIDEO_W * 16 // 9
 UI_SCALE = VIDEO_W / 1080              # every layout pixel below is authored for 1080 wide and scaled by this
 DPI = VIDEO_W / 10.8                   # keeps every font/layout proportion identical at any size
 OUTPUT_FPS = 30
 RENDER_FPS = 15                        # heavy matplotlib layer is redrawn at this rate, frames are repeated
-VIDEO_BITRATE = "8000k"
+VIDEO_BITRATE = "4500k" if VIDEO_W <= 720 else "8000k"
 X264_PRESET = "ultrafast"
 BG_MUSIC_VOLUME = 0.12
 BG_MUSIC_FADE_OUT = 2.0
@@ -65,8 +61,11 @@ SHORTS_MAX_SECONDS = 59.0              # stock segments that would push the vide
 
 # --- Parallelism ---
 IO_WORKERS = 1                       # threads for network calls
-PARALLEL_RENDER = False                 # render each scene in its own process
-MAX_RENDER_WORKERS = 1
+# Keep TTS and each render in an isolated, sequential OS process.
+# This prevents the Torch model and old Matplotlib figures accumulating in Streamlit.
+RENDER_IN_SUBPROCESS = True
+FFMPEG_THREADS = 1
+LOG_EVERY_SECONDS = 8
 
 
 # --- Data ---
@@ -156,6 +155,68 @@ class FullVideoScriptSchema(BaseModel):
     tags: str
 
 
+# Heavy dependencies are imported only where used:
+# * yfinance + Gemini in the parent (market/LLM phase)
+# * Matplotlib in the short-lived scene worker, not in the Streamlit app process
+# * Kokoro / Torch only in the short-lived TTS worker
+@lru_cache(maxsize=1)
+def _yf():
+    import yfinance as yf
+    return yf
+
+
+def load_render_dependencies() -> None:
+    global Figure, FigureCanvasAgg, Rectangle, FuncFormatter
+    if "Figure" not in globals():
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.patches import Rectangle
+        from matplotlib.ticker import FuncFormatter
+
+
+# =====================================================================
+# STREAMLIT MEMORY CONTROL / PROCESS ISOLATION
+# =====================================================================
+def log_memory(stage: str) -> None:
+    """Linux RSS + total cgroup usage (including ffmpeg and other Streamlit processes)."""
+    try:
+        rss_mib = None
+        status = Path("/proc/self/status")
+        if status.exists():
+            for line in status.read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_mib = int(line.split()[1]) / 1024
+                    break
+        cur = Path("/sys/fs/cgroup/memory.current")
+        lim = Path("/sys/fs/cgroup/memory.max")
+        total = int(cur.read_text()) / (1024 ** 2) if cur.exists() else None
+        raw_lim = lim.read_text().strip() if lim.exists() else "max"
+        max_mib = int(raw_lim) / (1024 ** 2) if raw_lim.isdecimal() else None
+        fmt = lambda n: f"{n:.0f} MiB" if n is not None else "N/A"
+        logger.info("RAM [%s] process=%s container=%s limit=%s",
+                    stage, fmt(rss_mib), fmt(total), fmt(max_mib))
+    except Exception as e:
+        logger.debug("RAM logging unavailable: %s", e)
+
+
+def run_memory_worker(kind: str, *args: str) -> None:
+    """Start one worker, wait for exit, reclaim its RAM before the next stage."""
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = "2"
+    env["MKL_NUM_THREADS"] = "2"
+    env["OPENBLAS_NUM_THREADS"] = "2"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{kind}-worker", *map(str, args)]
+    log_memory(f"before {kind} worker")
+    logger.info("Starting isolated %s worker", kind)
+    completed = subprocess.run(cmd, env=env, check=False)
+    gc.collect()
+    log_memory(f"after {kind} worker")
+    if completed.returncode:
+        msg = " (OS killed it; likely OOM)" if completed.returncode in (-9, 137) else ""
+        raise RuntimeError(f"{kind} worker exit code {completed.returncode}{msg}; check Streamlit logs")
+
+
 # =====================================================================
 # 2. GENERIC HELPERS
 # =====================================================================
@@ -226,6 +287,7 @@ def get_gemini_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is missing!")
+    from google import genai
     return genai.Client(api_key=api_key)
 
 
@@ -277,7 +339,7 @@ def fetch_daily_market_news_from_rss() -> str:
 
 def _fetch_close_change(ticker: str, period: str, min_rows: int = 1) -> Optional[dict]:
     try:
-        hist = yf.Ticker(ticker).history(period=period)
+        hist = _yf().Ticker(ticker).history(period=period)
         if hist.empty or len(hist) < min_rows:
             return None
         last = float(hist["Close"].iloc[-1])
@@ -317,7 +379,7 @@ def fetch_top_movers_and_watchlist(max_items: int = 7) -> List[dict]:
 
 def _fetch_intraday(symbol: str):
     try:
-        return yf.Ticker(symbol).history(period="1d", interval="5m", prepost=True)
+        return _yf().Ticker(symbol).history(period="1d", interval="5m", prepost=True)
     except Exception as e:
         logger.warning(f"Failed intraday fetch for {symbol}: {e}")
         return None
@@ -335,7 +397,11 @@ def _process_series(df, target_len: int = 300) -> Tuple[np.ndarray, float]:
     pct = (vals - first) / first * 100.0
     x_smooth = np.linspace(0, 1, target_len)
     x_raw = np.linspace(0, 1, n)
-    y = make_interp_spline(x_raw, pct, k=3)(x_smooth) if n >= 4 else np.interp(x_smooth, x_raw, pct)
+    if n >= 4:
+        from scipy.interpolate import make_interp_spline
+        y = make_interp_spline(x_raw, pct, k=3)(x_smooth)
+    else:
+        y = np.interp(x_smooth, x_raw, pct)
     return y, float(vals[-1])
 
 
@@ -371,7 +437,7 @@ def fetch_stock_history(stock: StockAnalysis):
     ]
     for kwargs in attempts:
         try:
-            df = yf.Ticker(stock.ticker).history(**kwargs).dropna()
+            df = _yf().Ticker(stock.ticker).history(**kwargs).dropna()
             if not df.empty:
                 return df
         except Exception as e:
@@ -404,6 +470,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
        Do NOT mention prices, price levels, percentages or any numbers in it.
     5. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field.
     """
+    from google.genai import types
     response = ask_llm(prompt, config=types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=FullVideoScriptSchema,
@@ -416,11 +483,9 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 # =====================================================================
 
 def get_kokoro_pipeline():
-    global _kokoro_pipeline
-    if _kokoro_pipeline is None:
-        logger.info("Initializing Kokoro-82M TTS Pipeline...")
-        _kokoro_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
-    return _kokoro_pipeline
+    """The heavyweight Kokoro / Torch imports only happen in the temporary TTS process."""
+    from kokoro import KPipeline
+    return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -429,43 +494,45 @@ def clean_script_for_tts(text: str) -> str:
     text = text.replace("$", "").replace("%", " percent")
     for pattern, replacement in TTS_SYMBOL_NAMES.items():
         text = re.sub(pattern, replacement, text)
-    text = text.replace('\n', ' ').strip()
-    return text
+    return text.replace("\n", " ").strip()
+
+
+def _generate_voiceovers_in_worker(items: List[Tuple[str, str]]) -> List[float]:
+    """Stream Kokoro output directly to WAV files; never concatenate all chunks in RAM."""
+    import soundfile as sf
+    import torch
+    torch.set_num_threads(2)
+    pipeline = get_kokoro_pipeline()
+    durations = []
+    logger.info("Generating %d Kokoro clips in isolated worker", len(items))
+    for text, path in items:
+        logger.info("Kokoro audio: %s", Path(path).name)
+        count = 0
+        with sf.SoundFile(str(path), "w", samplerate=24000, channels=1,
+                          format="WAV", subtype="PCM_16") as out:
+            for _, _, audio in pipeline(clean_script_for_tts(text), voice="am_liam", speed=1.1,
+                                         split_pattern=r"\n+"):
+                if hasattr(audio, "detach"):
+                    audio = audio.detach().cpu().numpy()
+                samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+                if samples.size:
+                    out.write(samples)
+                    count += samples.size
+        if not count:
+            raise RuntimeError(f"Kokoro returned empty audio for {path}")
+        durations.append(count / 24000)
+        logger.info("Created %s (%.2fs)", Path(path).name, durations[-1])
+    del pipeline
+    return durations
 
 
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
-    """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
-    logger.info(f"Generating {len(items)} TTS clips locally with Kokoro-82M (Voice: am_liam)...")
-    pipeline = get_kokoro_pipeline()
-    durations = []
-
-    for text, path in items:
-        clean_text = clean_script_for_tts(text)
-        path_str = str(path)
-        logger.info(f"Generating Kokoro audio: {Path(path_str).name}")
-
-        generator = pipeline(
-            clean_text,
-            voice='am_liam',   # Selected voice
-            speed=1.1,         # Fast speed for shorts
-            split_pattern=r'\n+'
-        )
-
-        all_audio = []
-        for _, _, audio in generator:
-            all_audio.append(audio)
-
-        if not all_audio:
-            raise RuntimeError(f"Kokoro failed to generate audio for {path_str}")
-
-        final_audio = np.concatenate(all_audio)
-        sf.write(path_str, final_audio, 24000)  # Kokoro uses 24kHz sample rate
-
-        dur = audio_duration(path_str)
-        durations.append(dur)
-        logger.info(f"✅ Created with Kokoro: {Path(path_str).name} ({dur:.2f}s)")
-
-    return durations
+    """Same public API; the Torch/Kokoro RAM is released when the worker exits."""
+    with tempfile.TemporaryDirectory(prefix="perfect_tts_") as td:
+        job_file, result_file = Path(td) / "job.json", Path(td) / "durations.json"
+        job_file.write_text(json.dumps([(str(t), str(p)) for t, p in items]), encoding="utf-8")
+        run_memory_worker("tts", str(job_file), str(result_file))
+        return json.loads(result_file.read_text(encoding="utf-8"))
 
 
 # =====================================================================
@@ -474,6 +541,7 @@ def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
 def new_figure(width_px: int = VIDEO_W, height_px: int = VIDEO_H, facecolor: str = C_BG):
     """Pyplot-free figure (no global state, safe in threads/processes).
     The +1e-3 guards against int() truncation giving a 1079/1919 px canvas."""
+    load_render_dependencies()
     fig = Figure(figsize=((width_px + 1e-3) / DPI, (height_px + 1e-3) / DPI), dpi=DPI, facecolor=facecolor)
     return fig, FigureCanvasAgg(fig)
 
@@ -553,35 +621,35 @@ class NewsTickerBar:
 # Avatar (every open/closed x bob combination is composited once, then cached)
 # ---------------------------------------------------------------------
 class AvatarPanel:
+    """Quantized bob states and Pillow compositing avoid a float64 cache explosion."""
     def __init__(self, size: int):
         self.size = size
         self._open = self._load(AVATAR_OPEN_PATH)
         self._closed = self._load(AVATAR_CLOSED_PATH)
-        bg = np.full((size, size, 3), [22, 27, 34], dtype=np.uint8)
-        bg[:4, :] = bg[-4:, :] = bg[:, :4] = bg[:, -4:] = [48, 54, 61]
-        self._bg = bg
+        self._bg = Image.new("RGB", (size, size), (22, 27, 34))
+        draw = ImageDraw.Draw(self._bg)
+        border = max(1, px(4))
+        draw.rectangle((0, 0, size - 1, size - 1), outline=(48, 54, 61), width=border)
         self._cache: Dict[Tuple[bool, int], np.ndarray] = {}
 
-    def _load(self, path: str) -> np.ndarray:
+    def _load(self, path: str) -> Image.Image:
         try:
-            return np.array(Image.open(path).convert("RGBA").resize((self.size, self.size)))
+            with Image.open(path) as im:
+                return im.convert("RGBA").resize((self.size, self.size))
         except Exception as e:
-            logger.warning(f"Avatar image missing ({path}): {e}")
-            return np.zeros((self.size, self.size, 4), dtype=np.uint8)
+            logger.warning("Avatar image missing (%s): %s", path, e)
+            return Image.new("RGBA", (self.size, self.size), (0, 0, 0, 0))
 
     def frame(self, is_open: bool, bob_px: int) -> np.ndarray:
+        # At most ~6 states per mouth instead of one for each pixel.
+        step = max(1, px(4))
+        bob_px = max(0, (bob_px + step // 2) // step * step)
         key = (is_open, bob_px)
         if key not in self._cache:
             sprite = self._open if is_open else self._closed
-            box = self._bg.copy()
-            alpha = sprite[:, :, 3:4] / 255.0          # float64 -> bit-identical to the original compositing
-            rgb = sprite[:, :, :3].astype(np.float64)
-            if bob_px > 0:  # character shifts up by bob_px
-                a, c, dst = alpha[bob_px:], rgb[bob_px:], box[:-bob_px]
-                box[:-bob_px] = (a * c + (1 - a) * dst).astype(np.uint8)
-            else:
-                box[:] = (alpha * rgb + (1 - alpha) * box).astype(np.uint8)
-            self._cache[key] = box
+            out = self._bg.copy()
+            out.paste(sprite, (0, -bob_px), sprite.getchannel("A"))
+            self._cache[key] = np.asarray(out, dtype=np.uint8)
         return self._cache[key]
 
 
@@ -978,6 +1046,7 @@ def frame_range(start_time: float, duration: float) -> Tuple[int, int]:
 def render_scene_job(job: SceneJob) -> str:
     """Top-level (picklable) worker: build one scene and encode it to a silent mp4."""
     scene = build_scene(job)
+    log_memory(f"render scene {job.kind} begin")
     first, last = frame_range(job.start_time, job.duration)
     n_frames = max(1, last - first)
 
@@ -985,12 +1054,15 @@ def render_scene_job(job: SceneJob) -> str:
         ffmpeg_exe(), "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{VIDEO_W}x{VIDEO_H}", "-r", str(OUTPUT_FPS), "-i", "-",
         "-an", "-c:v", "libx264", "-preset", X264_PRESET, "-b:v", VIDEO_BITRATE,
-        "-pix_fmt", "yuv420p", "-threads", str(job.ffmpeg_threads), job.out_path,
+        "-pix_fmt", "yuv420p", "-threads:v", str(FFMPEG_THREADS),
+        "-filter_threads", "1", job.out_path,
     ]
     with tempfile.TemporaryFile() as err_file:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err_file)
         try:
             for i in range(n_frames):
+                if i and i % (OUTPUT_FPS * LOG_EVERY_SECONDS) == 0:
+                    log_memory(f"render {job.kind} {i / OUTPUT_FPS:.0f}s/{job.duration:.0f}s")
                 g = first + i
                 t = max(0.0, g / OUTPUT_FPS - job.start_time)
                 proc.stdin.write(np.ascontiguousarray(scene.frame_at(t)))
@@ -998,30 +1070,36 @@ def render_scene_job(job: SceneJob) -> str:
             proc.wait()
         except BrokenPipeError:
             proc.wait()
-        except Exception:
+        except BaseException:
             proc.kill()
+            proc.wait()
             raise
         if proc.returncode != 0:
             err_file.seek(0)
             raise RuntimeError(f"ffmpeg failed for {job.kind} scene: {err_file.read().decode(errors='ignore')}")
+    log_memory(f"render scene {job.kind} finished")
     return job.out_path
 
 
-def render_scenes(jobs: List[SceneJob]) -> List[str]:
-    workers = min(len(jobs), MAX_RENDER_WORKERS)
-    for j in jobs:
-        j.ffmpeg_threads = max(1, (os.cpu_count() or 1) // max(1, workers))
-
-    if PARALLEL_RENDER and workers > 1:
-        logger.info(f"🎞️ Rendering {len(jobs)} scenes in parallel on {workers} processes...")
-        try:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                return list(ex.map(render_scene_job, jobs))
-        except Exception as e:
-            logger.warning(f"Parallel rendering failed ({e}); falling back to sequential rendering.")
-
-    logger.info(f"🎞️ Rendering {len(jobs)} scenes sequentially...")
-    return [render_scene_job(j) for j in jobs]
+def render_scenes(jobs: List[SceneJob], work_dir: Path) -> List[str]:
+    """One subprocess at a time: each Matplotlib scene is fully freed on process exit."""
+    logger.info("Rendering %d scenes sequentially, each in its own process", len(jobs))
+    paths = []
+    for index, job in enumerate(jobs):
+        job.ffmpeg_threads = FFMPEG_THREADS
+        if RENDER_IN_SUBPROCESS:
+            input_file = work_dir / f"render_job_{index}.pkl"
+            with input_file.open("wb") as f:
+                pickle.dump(job, f, protocol=pickle.HIGHEST_PROTOCOL)
+            try:
+                run_memory_worker("render", str(input_file))
+            finally:
+                input_file.unlink(missing_ok=True)
+        else:
+            render_scene_job(job)
+        paths.append(job.out_path)
+        log_memory(f"scene {index + 1}/{len(jobs)} complete")
+    return paths
 
 
 # =====================================================================
@@ -1082,7 +1160,8 @@ def run_perfect_pipeline(
         bg_music_path: Optional[str] = "assets/weekly_recup_music.mp3",
         upload: bool = False,
 ) -> str:
-    logger.info("🚀 Launching Daily Shorts Pipeline (Web Search Mode)...")
+    logger.info("🚀 Launching Daily Shorts Pipeline (low-memory Streamlit mode)...")
+    log_memory("pipeline start")
     work_dir = Path(tempfile.mkdtemp(prefix="daily_shorts_"))
 
     try:
@@ -1095,14 +1174,17 @@ def run_perfect_pipeline(
             script = generate_verified_script(market_summary, verified_data)
 
             stocks = list(script.analyzed_stocks)
-            history_futures = [pool.submit(fetch_stock_history, s) for s in stocks]   # overlap with TTS
+            history_futures = [pool.submit(fetch_stock_history, s) for s in stocks]
 
-            speech_items = [(script.intro_script, work_dir / "intro.mp3")] + [
-                (s.script, work_dir / f"stock_{i}_{s.ticker}.mp3") for i, s in enumerate(stocks)]
-            durations = generate_voiceovers(speech_items)
-
+            # Finish background network activity BEFORE launching heavyweight Torch/Kokoro.
             histories = [f.result() for f in history_futures]
             market_data = market_future.result()
+
+        log_memory("market data ready")
+        speech_items = [(script.intro_script, work_dir / "intro.wav")] + [
+            (s.script, work_dir / f"stock_{i}_{s.ticker}.wav") for i, s in enumerate(stocks)]
+        durations = generate_voiceovers(speech_items)
+        log_memory("TTS completed / model unloaded")
 
         # ---- Phase B: build the timeline ----
         jobs: List[SceneJob] = []
@@ -1141,11 +1223,16 @@ def run_perfect_pipeline(
             final_description += "\n\n#Shorts"
 
         # ---- Phase C: render + assemble ----
-        scene_paths = render_scenes(jobs)
+        # Drop redundant history references before rendering, jobs now own the inputs.
+        del histories, stocks, market_data
+        gc.collect()
+        scene_paths = render_scenes(jobs, work_dir)
+        log_memory("scenes rendered")
         assemble_final_video(scene_paths, voice_tracks, total_frames, bg_music_path, output_filename, work_dir)
 
         # ---- Phase D: upload ----
-        if upload and callable(upload_video):
+        if upload:
+            from uploader import upload_video  # import only when an upload is requested
             logger.info("🚀 Uploading Short to YouTube...")
             upload_video(
                 file_path=output_filename,
@@ -1154,6 +1241,7 @@ def run_perfect_pipeline(
                 tags=script.tags,
             )
 
+        log_memory("pipeline finished")
         logger.info("✅ Shorts pipeline executed successfully!")
         return output_filename
 
@@ -1163,4 +1251,18 @@ def run_perfect_pipeline(
 
 
 if __name__ == "__main__":
-    run_perfect_pipeline()
+    if len(sys.argv) > 1 and sys.argv[1] == "--tts-worker":
+        if len(sys.argv) != 4:
+            raise SystemExit("Usage: --tts-worker input.json durations.json")
+        items = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        durations = _generate_voiceovers_in_worker(items)
+        Path(sys.argv[3]).write_text(json.dumps(durations), encoding="utf-8")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--render-worker":
+        if len(sys.argv) != 3:
+            raise SystemExit("Usage: --render-worker job.pkl")
+        # This pickle file is written by this application into its private temp dir.
+        with open(sys.argv[2], "rb") as f:
+            job = pickle.load(f)
+        render_scene_job(job)
+    else:
+        run_perfect_pipeline()
