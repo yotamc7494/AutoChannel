@@ -1,4 +1,4 @@
-# Patched for low-memory Streamlit deployments.
+# Patched for low-memory Streamlit deployments. v2 fixes cgroup page-cache accounting.
 # Optional environment settings:
 #   STOCK_APPROX_TIMINGS=1     skips Whisper (estimated subtitle timings)
 #   STOCK_DISABLE_BG_VIDEO=1   eliminates background-video decode cost
@@ -166,74 +166,126 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("StockShort")
 
 
-def log_memory(stage: str):
-    """Log cgroup memory (whole Streamlit container) and this process's RSS (Linux)."""
+def _cgroup_memory_snapshot() -> dict:
+    """Read Linux cgroup v2 accounting, distinguishing page cache from held RAM.
+
+    memory.current includes file-backed cache that the kernel can usually reclaim.
+    It must *not* be treated as the same thing as anonymous/process RAM.
+    All derived cache figures are estimates, not a promise of free memory.
+    """
+    path = Path('/sys/fs/cgroup')
+    result = {'raw': None, 'limit': None, 'reclaimable': 0,
+              'guarded': None, 'anon': 0, 'file': 0, 'shmem': 0,
+              'inactive_file': 0, 'oom_kill': None}
     try:
-        rss_kb = None
-        for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                rss_kb = int(line.split()[1])
-                break
-        app_mib = None
-        limit_mib = None
-        cgroup = Path("/sys/fs/cgroup/memory.current")
-        if cgroup.exists():
-            app_mib = int(cgroup.read_text().strip()) / (1024 * 1024)
-            max_file = Path("/sys/fs/cgroup/memory.max")
-            if max_file.exists():
-                max_val = max_file.read_text().strip()
-                if max_val.isdecimal():
-                    limit_mib = int(max_val) / (1024 * 1024)
+        raw_path, limit_path = path / 'memory.current', path / 'memory.max'
+        if not raw_path.exists():
+            return result
+        result['raw'] = int(raw_path.read_text().strip())
+        max_value = limit_path.read_text().strip() if limit_path.exists() else 'max'
+        result['limit'] = int(max_value) if max_value.isdecimal() else None
+        stat_path = path / 'memory.stat'
+        stats = {}
+        if stat_path.exists():
+            for line in stat_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        stats[parts[0]] = int(parts[1])
+                    except ValueError:
+                        continue
+        for name in ('anon', 'file', 'shmem', 'inactive_file'):
+            result[name] = stats.get(name, 0)
+        # 'file' also accounts for tmpfs/shmem, which should not be deducted.
+        # Dirty/writeback pages are not immediately reclaimable either.
+        clean_file_cache = max(0, stats.get('file', 0) - stats.get('shmem', 0)
+                               - stats.get('file_dirty', 0) - stats.get('file_writeback', 0))
+        result['reclaimable'] = min(stats.get('inactive_file', 0), clean_file_cache)
+        # Conservative margin: credit only 85% of the estimated inactive file cache.
+        result['guarded'] = max(0, result['raw'] - int(result['reclaimable'] * 0.85))
+        events_path = path / 'memory.events'
+        if events_path.exists():
+            for line in events_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == 'oom_kill':
+                    result['oom_kill'] = int(parts[1])
+    except (OSError, ValueError):
+        # If cgroup stats are absent, fail open only when no limit can be read;
+        # ordinary Linux OOM protection still applies.
+        if result['raw'] is not None:
+            result['guarded'] = result['raw']
+    return result
+
+
+def log_memory(stage: str):
+    """Log main-process RSS and container raw vs estimated pressured memory."""
+    try:
+        rss_kb = next((int(line.split()[1]) for line in Path('/proc/self/status').read_text().splitlines()
+                       if line.startswith('VmRSS:')), None)
+        m = _cgroup_memory_snapshot()
+        def mb(n):
+            return f'{n / 2**20:.0f}' if n is not None else 'N/A'
         logger.info(
-            "MEMORY [%s]: main RSS=%s MiB, app/cgroup=%s MiB, limit=%s MiB",
-            stage,
-            f"{rss_kb / 1024:.0f}" if rss_kb is not None else "N/A",
-            f"{app_mib:.0f}" if app_mib is not None else "N/A",
-            f"{limit_mib:.0f}" if limit_mib is not None else "N/A",
+            'MEMORY [%s]: main RSS=%s MiB, cgroup=%s/%s MiB, '
+            'anon=%s MiB, file=%s MiB, shmem=%s MiB, '
+            'inactive_file=%s MiB, estimated_reclaimable=%s MiB, '
+            'guarded_usage=%s MiB, cgroup_oom_kill=%s',
+            stage, f'{rss_kb / 1024:.0f}' if rss_kb is not None else 'N/A',
+            mb(m['raw']), mb(m['limit']), mb(m['anon']), mb(m['file']),
+            mb(m['shmem']), mb(m['inactive_file']), mb(m['reclaimable']),
+            mb(m['guarded']), m['oom_kill'] if m['oom_kill'] is not None else 'N/A',
         )
     except Exception as e:
-        logger.debug("Memory measurement unavailable: %s", e)
-
-
-def _cgroup_usage_limit() -> Tuple[Optional[int], Optional[int]]:
-    try:
-        cur_file, limit_file = Path('/sys/fs/cgroup/memory.current'), Path('/sys/fs/cgroup/memory.max')
-        cur = int(cur_file.read_text()) if cur_file.exists() else None
-        raw = limit_file.read_text().strip() if limit_file.exists() else 'max'
-        limit = int(raw) if raw.isdecimal() else None
-        return cur, limit
-    except (OSError, ValueError):
-        return None, None
+        logger.debug('Memory measurement unavailable: %s', e)
 
 
 def run_memory_worker(kind: str, *args: str) -> None:
-    """Use a lean ML subprocess and guard the container before Linux's OOM killer strikes."""
+    """Run the ML task in its own lean process and monitor true memory pressure.
+
+    Previously this guard checked memory.current directly, so a cgroup at
+    3072/3072 MiB due to *reclaimable file cache* was falsely rejected.
+    """
     cmd = [sys.executable, str(Path(__file__).resolve()), f'--{kind}-worker', *map(str, args)]
     env = os.environ.copy()
-    # setdefault does NOT override existing large thread-pool settings
     for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         env[name] = '1'
     env['TOKENIZERS_PARALLELISM'] = 'false'
+    env['MALLOC_ARENA_MAX'] = '2'
     logger.info('Starting lightweight %s worker...', kind)
     log_memory(f'before {kind}')
-    before_usage, limit = _cgroup_usage_limit()
-    # Configurable. For a 1 GiB container, reserve at least 96 MiB of headroom.
-    fraction = float(os.getenv('STOCK_MEMORY_GUARD_FRACTION', '0.92'))
+    before = _cgroup_memory_snapshot()
+    limit = before['limit']
+    fraction = min(0.98, max(0.50, float(os.getenv('STOCK_MEMORY_GUARD_FRACTION', '0.92'))))
     threshold = min(limit * fraction, limit - 96 * 2**20) if limit else None
-    if threshold is not None and before_usage is not None and before_usage >= threshold:
-        raise MemoryError(f'Container already uses {before_usage / 2**20:.0f} / '
-                          f'{limit / 2**20:.0f} MiB before {kind}; not launching ML worker.')
-    peak = before_usage or 0
+    current_guarded = before['guarded']
+    if threshold is not None and current_guarded is not None and current_guarded >= threshold:
+        raise MemoryError(
+            f'Not enough non-reclaimable RAM before {kind}: '
+            f'cgroup raw={before["raw"] / 2**20:.0f} / {limit / 2**20:.0f} MiB, '
+            f'file cache estimate={before["reclaimable"] / 2**20:.0f} MiB, '
+            f'guarded usage={current_guarded / 2**20:.0f} MiB '
+            f'(threshold={threshold / 2**20:.0f} MiB). '
+            'This is actual memory pressure, not merely raw page cache. '
+            'See the MEMORY log for main RSS/anon/shmem and restart the app '
+            'if there are stuck processes.')
+
+    raw_peak = before['raw'] or 0
+    guarded_peak = current_guarded or 0
     killed_by_guard = False
     proc = subprocess.Popen(cmd, env=env)
     try:
         while proc.poll() is None:
-            used, _ = _cgroup_usage_limit()
-            if used is not None:
-                peak = max(peak, used)
-            if threshold is not None and used is not None and used > threshold:
-                logger.error('MEMORY GUARD in %s: used %.0f MiB of %.0f MiB; stopping worker',
-                             kind, used / 2**20, limit / 2**20)
+            stats = _cgroup_memory_snapshot()
+            if stats['raw'] is not None:
+                raw_peak = max(raw_peak, stats['raw'])
+            if stats['guarded'] is not None:
+                guarded_peak = max(guarded_peak, stats['guarded'])
+            if (threshold is not None and stats['guarded'] is not None
+                    and stats['guarded'] > threshold):
+                logger.error('MEMORY GUARD in %s: guarded=%.0f MiB / limit %.0f MiB '
+                             '(raw=%.0f, reclaimable cache=%.0f); stopping worker',
+                             kind, stats['guarded']/2**20, limit/2**20,
+                             (stats['raw'] or 0)/2**20, stats['reclaimable']/2**20)
                 killed_by_guard = True
                 proc.kill()
                 break
@@ -244,16 +296,19 @@ def run_memory_worker(kind: str, *args: str) -> None:
             proc.kill()
             proc.wait()
     gc.collect()
-    log_memory(f'after {kind}; peak container {peak / 2**20:.0f} MiB')
+    log_memory(f'after {kind}; raw peak {raw_peak / 2**20:.0f} MiB; '
+               f'guarded peak {guarded_peak / 2**20:.0f} MiB')
     if killed_by_guard:
-        raise MemoryError(f'{kind} exceeded memory guard: container reached '
-                          f'{peak / 2**20:.0f} / {limit / 2**20:.0f} MiB. '
-                          'Enable STOCK_APPROX_TIMINGS=1 if this was Whisper; '
-                          'Kokoro requires a larger RAM plan or remote TTS if this was TTS.')
+        raise MemoryError(f'{kind} exceeded guarded memory threshold: '
+                          f'guarded peak {guarded_peak / 2**20:.0f} MiB / '
+                          f'limit {limit / 2**20:.0f} MiB. '
+                          'If this was Whisper, use STOCK_APPROX_TIMINGS=1. '
+                          'If Kokoro truly needs more RAM, move TTS to an API or upgrade memory.')
     if retcode != 0:
         detail = 'OS killed the worker (likely OOM).' if retcode in (-9, 137) else 'See worker traceback above.'
         raise RuntimeError(f'{kind} worker exited {retcode}. {detail} '
-                           f'Peak container memory observed: {peak / 2**20:.0f} MiB.')
+                           f'Raw peak {raw_peak / 2**20:.0f} MiB; '
+                           f'guarded peak {guarded_peak / 2**20:.0f} MiB.')
 
 
 # =====================================================================
