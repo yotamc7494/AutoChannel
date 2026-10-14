@@ -16,7 +16,6 @@ except Exception:
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
 from main import render_final_video, view_final_video
-from weekly_summery_video import generate_and_upload_video
 from streamlit.logger import get_logger
 from daily_recap_shorts import run_perfect_pipeline
 
@@ -41,10 +40,6 @@ if "WEBHOOK_TOKEN" in query_params:
             st.stop()
         elif video_type == "vs_video":
             filename = run_generator()
-            st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
-            st.stop()
-        elif video_type == "weekly_summery":
-            filename = generate_and_upload_video(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "daily_summery":
@@ -221,7 +216,6 @@ video_type = st.selectbox(
     [
         "סרטון מנייה",
         "סרטון השוואה",
-        "סיכום שבועי",
         "סיכום יומי (משודרג)"
     ]
 )
@@ -297,9 +291,6 @@ if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
 
             elif video_type == "סרטון השוואה":
                 video_path = run_generator(is_test_mode)
-
-            elif video_type == "סיכום שבועי":
-                video_path = generate_and_upload_video(upload=should_upload)
 
             elif video_type == "סיכום יומי (משודרג)":
                 output_file = "perfect_daily_recap.mp4"
