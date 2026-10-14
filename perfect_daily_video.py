@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -18,7 +17,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import edge_tts
 import numpy as np
 import requests
 import yfinance as yf
@@ -67,11 +65,10 @@ PARALLEL_RENDER = True                 # render each scene in its own process
 MAX_RENDER_WORKERS = os.cpu_count() or 1
 
 # --- TTS ---
-TTS_VOICE = "en-US-ChristopherNeural"
-TTS_RATE = "+5%"
-TTS_CONCURRENCY = 1
-MAX_PROXY_ATTEMPTS = 10
-PROXY_TIMEOUT_SEC = 15
+PIPER_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx"
+PIPER_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx.json"
+PIPER_MODEL_FILE = "en_US-ryan-high.onnx"
+PIPER_CONFIG_FILE = "en_US-ryan-high.onnx.json"
 
 # --- Data ---
 RSS_QUERIES = [
@@ -410,68 +407,51 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 # =====================================================================
 # 6. TEXT-TO-SPEECH  (Sequential fallback logic from the old script)
 # =====================================================================
+def ensure_piper_model():
+    """מוריד את מודל הקול פעם אחת בלבד אם הוא לא קיים בתיקייה המקומית"""
+    if not os.path.exists(PIPER_MODEL_FILE) or not os.path.exists(PIPER_CONFIG_FILE):
+        logger.info("Downloading Piper voice model (one-time setup)...")
+        urllib.request.urlretrieve(PIPER_MODEL_URL, PIPER_MODEL_FILE)
+        urllib.request.urlretrieve(PIPER_CONFIG_URL, PIPER_CONFIG_FILE)
+        logger.info("✅ Piper voice model ready!")
+
+
 def clean_script_for_tts(text: str) -> str:
     """Removes non-ASCII characters/emojis & converts symbols for clear TTS."""
     text = re.sub(r"[^\x00-\x7F]+", "", text)
     text = text.replace("$", "").replace("%", " percent")
     for pattern, replacement in TTS_SYMBOL_NAMES.items():
         text = re.sub(pattern, replacement, text)
+
+    # ניקוי נוסף עבור Piper: הסרת ירידות שורה מיותרות
+    text = text.replace('\n', ' ').strip()
     return text
 
 
-def fetch_free_proxies() -> list:
-    """שולף רשימת פרוקסים חינמיים מעודכנת בזמן אמת"""
-    try:
-        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2500&country=all&ssl=all&anonymity=all"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            return [p.strip() for p in response.text.splitlines() if p.strip()]
-    except Exception as e:
-        logger.warning(f"Could not fetch proxy list: {e}")
-    return []
-
-
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
-    """items = [(script_text, output_mp3_path), ...]  ->  durations in seconds (same order)."""
-    logger.info(f"Generating {len(items)} TTS clips sequentially (old method)...")
+    """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
+    logger.info(f"Generating {len(items)} TTS clips locally with Piper...")
     durations = []
+
+    # מוודא שהמודל קיים לפני שמתחילים
+    ensure_piper_model()
 
     for text, path in items:
         clean_text = clean_script_for_tts(text)
-        path = str(path)
-        logger.info(f"Generating TTS audio: {path}")
+        path_str = str(path)
+        logger.info(f"Generating TTS audio: {Path(path_str).name}")
 
-        async def _save():
-            # 1. ניסיון חיבור ישיר
-            try:
-                comm = edge_tts.Communicate(clean_text, TTS_VOICE, rate=TTS_RATE)
-                await comm.save(path)
-                return
-            except Exception as e:
-                logger.warning(f"Direct TTS failed ({e}), switching to proxy fallback...")
+        # הרצת פקודת Piper עם הזרקת הטקסט ישירות למנוע, ללא צורך בהתעסקות במרכאות
+        cmd = ["piper", "--model", PIPER_MODEL_FILE, "--output_file", path_str]
+        proc = subprocess.run(cmd, input=clean_text.encode('utf-8'), capture_output=True)
 
-            # 2. ניסיון דרך רשימת פרוקסים חינמיים
-            proxies = fetch_free_proxies()
-            for proxy_ip in proxies:
-                proxy_url = f"http://{proxy_ip}"
-                try:
-                    logger.info(f"Attempting TTS via proxy: {proxy_url}")
-                    comm = edge_tts.Communicate(clean_text, TTS_VOICE, rate=TTS_RATE, proxy=proxy_url)
-                    await comm.save(path)
-                    logger.info(f"✅ TTS generated successfully via proxy: {proxy_url}")
-                    return
-                except Exception:
-                    continue
+        if proc.returncode != 0:
+            raise RuntimeError(f"Piper TTS failed for {path_str}: {proc.stderr.decode(errors='ignore')}")
 
-            raise RuntimeError(f"All proxy attempts failed for TTS ({Path(path).name}).")
-
-        # הרצה בתוך ThreadPoolExecutor למניעת התנגשות ב-Event Loop
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, _save())
-            future.result()
-
-        # חישוב האורך באמצעות הפונקציה הקיימת בקוד החדש, ללא MoviePy
-        durations.append(audio_duration(path))
+        # חישוב האורך באמצעות הפונקציה הקיימת בקוד
+        dur = audio_duration(path_str)
+        durations.append(dur)
+        logger.info(f"✅ Created: {Path(path_str).name} ({dur:.2f}s)")
 
     return durations
 
