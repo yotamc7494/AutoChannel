@@ -64,9 +64,9 @@ BG_MUSIC_FADE_OUT = 2.0
 SHORTS_MAX_SECONDS = 59.0              # stock segments that would push the video past this are dropped
 
 # --- Parallelism ---
-IO_WORKERS = 8                         # threads for network calls
+IO_WORKERS = 2                       # threads for network calls
 PARALLEL_RENDER = True                 # render each scene in its own process
-MAX_RENDER_WORKERS = os.cpu_count() or 1
+MAX_RENDER_WORKERS = 2
 
 
 # --- Data ---
@@ -342,7 +342,7 @@ def _process_series(df, target_len: int = 300) -> Tuple[np.ndarray, float]:
 def fetch_intro_index_data() -> dict:
     logger.info("📊 Fetching intraday index data...")
     symbols = {"SPY": "SPY", "QQQ": "QQQ", "BTC": "BTC-USD"}
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         watch_f = ex.submit(fetch_top_movers_and_watchlist)
         hist_f = {k: ex.submit(_fetch_intraday, s) for k, s in symbols.items()}
         hist = {k: f.result() for k, f in hist_f.items()}

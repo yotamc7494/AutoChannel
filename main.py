@@ -565,7 +565,7 @@ def fetch_market_metrics(symbol: str) -> Dict[str, Optional[str]]:
             logger.warning(f"⚠️ {what} unavailable: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         cap_f = ex.submit(attempt, lambda: _fetch_market_cap(symbol), f"{symbol} market cap")
         sp_f = ex.submit(attempt, lambda: _fetch_last_price("^GSPC"), "S&P 500 price")
         btc_f = ex.submit(attempt, lambda: _fetch_last_price("BTC-USD"), "BTC price")
@@ -1237,7 +1237,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
     work_dir = Path(tempfile.mkdtemp(prefix="stock_short_"))
     try:
         # ---- Phase A: data + audio. Independent network calls overlap; Whisper loads in the background ----
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             whisper_future = pool.submit(get_whisper_model)
 
             stock_data = get_top_moving_stock(test=test)
