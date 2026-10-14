@@ -649,7 +649,6 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
 # =====================================================================
 # 7. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
-@st.cache_resource
 def get_kokoro_pipeline():
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
