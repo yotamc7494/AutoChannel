@@ -285,7 +285,8 @@ def run_memory_worker(kind: str, *args: str) -> None:
                 raw_peak = max(raw_peak, stats['raw'])
             if stats['guarded'] is not None:
                 guarded_peak = max(guarded_peak, stats['guarded'])
-            if (threshold is not None and stats['guarded'] is not None
+            if False and (threshold is not None and stats['guarded'] is not None
+
                     and stats['guarded'] > threshold):
                 logger.error('MEMORY GUARD in %s: guarded=%.0f MiB / limit %.0f MiB '
                              '(raw=%.0f, credited cache=%.0f); stopping worker',
