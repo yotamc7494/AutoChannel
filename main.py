@@ -19,6 +19,7 @@ Stages
 Dependencies: numpy, scipy, matplotlib, Pillow, yfinance, openai-whisper, google-genai, upstash-redis,
 python-dotenv, requests (+ the `piper` CLI and an ffmpeg binary). moviepy is no longer needed.
 """
+import gc
 import json
 import logging
 import math
@@ -49,8 +50,6 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Polygon
 from PIL import Image, ImageDraw, ImageFont
 from scipy.interpolate import PchipInterpolator
-import soundfile as sf
-from kokoro import KPipeline
 
 # Global pipeline initialization (loads model once)
 _kokoro_pipeline = None
@@ -59,7 +58,6 @@ try:
 except ImportError:  # pragma: no cover
     httpx = None
 
-from uploader import upload_video
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
@@ -67,11 +65,59 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("StockShort")
 
 
+def log_memory(stage: str):
+    """Log cgroup memory (whole Streamlit container) and this process's RSS (Linux)."""
+    try:
+        rss_kb = None
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+                break
+        app_mib = None
+        limit_mib = None
+        cgroup = Path("/sys/fs/cgroup/memory.current")
+        if cgroup.exists():
+            app_mib = int(cgroup.read_text().strip()) / (1024 * 1024)
+            max_file = Path("/sys/fs/cgroup/memory.max")
+            if max_file.exists():
+                max_val = max_file.read_text().strip()
+                if max_val.isdecimal():
+                    limit_mib = int(max_val) / (1024 * 1024)
+        logger.info(
+            "MEMORY [%s]: main RSS=%s MiB, app/cgroup=%s MiB, limit=%s MiB",
+            stage,
+            f"{rss_kb / 1024:.0f}" if rss_kb is not None else "N/A",
+            f"{app_mib:.0f}" if app_mib is not None else "N/A",
+            f"{limit_mib:.0f}" if limit_mib is not None else "N/A",
+        )
+    except Exception as e:
+        logger.debug("Memory measurement unavailable: %s", e)
+
+
+def run_memory_worker(kind: str, *args: str) -> None:
+    """Run TTS or Whisper in a *separate OS process* to return its RAM to the OS on exit."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{kind}-worker", *map(str, args)]
+    env = os.environ.copy()
+    env.setdefault("OMP_NUM_THREADS", "2")
+    env.setdefault("MKL_NUM_THREADS", "2")
+    env.setdefault("OPENBLAS_NUM_THREADS", "2")
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    logger.info("Starting isolated %s worker...", kind)
+    log_memory(f"before {kind}")
+    completed = subprocess.run(cmd, env=env, check=False)
+    gc.collect()
+    log_memory(f"after {kind}")
+    if completed.returncode != 0:
+        detail = "The worker was killed by the OS (possible OOM)." if completed.returncode in (-9, 137) else "Check Streamlit Cloud logs."
+        raise RuntimeError(f"{kind} worker exited with status {completed.returncode}. {detail}")
+
+
 # =====================================================================
 # 1. CONFIG
 # =====================================================================
 # --- Video ---
-VIDEO_W, VIDEO_H = 1080, 1920
+VIDEO_W, VIDEO_H = 1080, 1920   # design coordinates (do not change)
+OUTPUT_W, OUTPUT_H = 720, 1280  # lower-memory final output; use 1080, 1920 if you have more RAM
 FPS = 24
 CHART_RENDER_FPS = 12              # the matplotlib chart is redrawn at this rate, frames are repeated
 BG_DIM = 0.22                      # brightness multiplier for the background video
@@ -650,9 +696,11 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
 # 7. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
 def get_kokoro_pipeline():
+    """Import the heavy ML dependency only in the TTS worker process."""
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
-        logger.info("Initializing Kokoro-82M TTS Pipeline...")
+        from kokoro import KPipeline
+        logger.info("Initializing Kokoro-82M TTS Pipeline in isolated worker...")
         _kokoro_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
     return _kokoro_pipeline
 
@@ -667,8 +715,11 @@ def clean_script_for_tts(text: str) -> str:
     return text
 
 
-def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
+def _generate_voiceovers_in_worker(items: List[Tuple[str, str]]) -> List[float]:
     """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
+    import soundfile as sf
+    import torch
+    torch.set_num_threads(2)
     logger.info(f"Generating {len(items)} TTS clips locally with Kokoro-82M (Voice: am_liam)...")
     pipeline = get_kokoro_pipeline()
     durations = []
@@ -687,7 +738,10 @@ def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
 
         all_audio = []
         for _, _, audio in generator:
-            all_audio.append(audio)
+            # Explicit conversion avoids keeping Torch tensors in the concatenation list.
+            if hasattr(audio, "detach"):
+                audio = audio.detach().cpu().numpy()
+            all_audio.append(np.asarray(audio, dtype=np.float32))
 
         if not all_audio:
             raise RuntimeError(f"Kokoro failed to generate audio for {path_str}")
@@ -702,6 +756,15 @@ def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
     return durations
 
 
+def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
+    """Compatibility wrapper: run the actual TTS model in a short-lived process."""
+    with tempfile.TemporaryDirectory(prefix="stock_tts_job_") as td:
+        job, result = Path(td) / "job.json", Path(td) / "durations.json"
+        job.write_text(json.dumps([(str(txt), str(path)) for txt, path in items]), encoding="utf-8")
+        run_memory_worker("tts", str(job), str(result))
+        return json.loads(result.read_text(encoding="utf-8"))
+
+
 # =====================================================================
 # 8. WORD TIMINGS (Whisper word timestamps)
 # =====================================================================
@@ -712,7 +775,7 @@ def get_whisper_model():
     return whisper.load_model("tiny.en")
 
 
-def transcribe_words(audio_file: str) -> List[dict]:
+def _transcribe_words_in_worker(audio_file: str) -> List[dict]:
     """
     Word-level timings: [{"raw", "text", "start", "end"}].
     `raw` keeps Whisper's punctuation (used to find sentence ends), `text` is the caption-ready word.
@@ -729,6 +792,14 @@ def transcribe_words(audio_file: str) -> List[dict]:
             text = re.sub(r"^[^\w$%]+|[^\w$%]+$", "", raw)   # captions look cleaner without edge punctuation
             words.append({"raw": raw, "text": text, "start": float(w["start"]), "end": float(w["end"])})
     return words
+
+
+def transcribe_words(audio_file: str) -> List[dict]:
+    """Return word timestamps while keeping Whisper out of the Streamlit process."""
+    with tempfile.TemporaryDirectory(prefix="stock_whisper_job_") as td:
+        result = Path(td) / "words.json"
+        run_memory_worker("whisper", str(audio_file), str(result))
+        return json.loads(result.read_text(encoding="utf-8"))
 
 
 def catalyst_window(words: List[dict], n_sentences: int, duration: float) -> Tuple[float, float]:
@@ -1151,14 +1222,35 @@ def _news_card_overlay(start: float, end: float) -> str:
     s = NEWS_CARD_SLIDE
     p_in = f"clip((t-{start:.3f})/{s},0,1)"
     p_out = f"clip((t-{end - s:.3f})/{s},0,1)"
-    x = f"{NEWS_CARD_X}+({VIDEO_W}-{NEWS_CARD_X})*(pow(1-{p_in},2)+pow({p_out},2))"   # ease-out in, ease-in out
-    return f"overlay=x='{x}':y={NEWS_CARD_Y}:enable='between(t,{start:.3f},{end:.3f})':format=auto"
+    render_scale = OUTPUT_W / VIDEO_W
+    resting_x = round(NEWS_CARD_X * render_scale)
+    card_y = round(NEWS_CARD_Y * render_scale)
+    x = f"{resting_x}+({OUTPUT_W}-{resting_x})*(pow(1-{p_in},2)+pow({p_out},2))"
+    return f"overlay=x='{x}':y={card_y}:enable='between(t,{start:.3f},{end:.3f})':format=auto"
 
 
 def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png: str, bg_path: Optional[str],
                  audio_path: str, duration: float, out_path: str,
                  news_card: Optional[Tuple[str, float, float]] = None) -> None:
     n_frames = max(1, round(duration * FPS))
+    scale = OUTPUT_W / VIDEO_W
+    if abs(OUTPUT_H / VIDEO_H - scale) > 1e-6:
+        raise ValueError("Output and design aspect ratios must match")
+
+    # Keep all chart/typography layout in the original 1080x1920 design coordinates;
+    # scale the composited raw frames and ffmpeg's PNG assets only at render time.
+    if scale != 1:
+        small_overlay = str(Path(overlay_png).with_name("_render_overlay.png"))
+        with Image.open(overlay_png) as im:
+            im.resize((OUTPUT_W, OUTPUT_H), Image.Resampling.LANCZOS).save(small_overlay)
+        overlay_png = small_overlay
+        if news_card:
+            card_path, c_start, c_end = news_card
+            small_card = str(Path(card_path).with_name("_render_news_card.png"))
+            with Image.open(card_path) as im:
+                im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))),
+                          Image.Resampling.LANCZOS).save(small_card)
+            news_card = (small_card, c_start, c_end)
 
     # which caption sprite is visible on each output frame (-1 = none)
     cap_for_frame = np.full(n_frames, -1, dtype=np.int32)
@@ -1168,11 +1260,11 @@ def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png
         cap_for_frame[max(0, f0):max(0, min(n_frames, f1))] = i
 
     bg_input = (["-stream_loop", "-1", "-i", bg_path] if bg_path
-                else ["-f", "lavfi", "-i", f"color=c=0x0B0E14:s={VIDEO_W}x{VIDEO_H}:r={FPS}"])
+                else ["-f", "lavfi", "-i", f"color=c=0x0B0E14:s={OUTPUT_W}x{OUTPUT_H}:r={FPS}"])
     # background: cover-fit to 1080x1920 (scale to height, centre crop), dim; then chart layer, then overlay PNG,
     # then (optionally) the sliding news card
-    graph = (f"[0:v]fps={FPS},scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
-             f"crop={VIDEO_W}:{VIDEO_H},colorchannelmixer=rr={BG_DIM}:gg={BG_DIM}:bb={BG_DIM},setsar=1[bg];"
+    graph = (f"[0:v]fps={FPS},scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+             f"crop={OUTPUT_W}:{OUTPUT_H},colorchannelmixer=rr={BG_DIM}:gg={BG_DIM}:bb={BG_DIM},setsar=1[bg];"
              "[bg][1:v]overlay=format=auto[a];")
     extra_inputs: List[str] = []
     if news_card:
@@ -1184,20 +1276,24 @@ def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png
         graph += "[a][2:v]overlay=format=auto[v]"
         audio_idx = 3
 
-    cmd = [ffmpeg_exe(), "-y", "-loglevel", "error", *bg_input,
-           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{VIDEO_W}x{VIDEO_H}", "-r", str(FPS), "-i", "-",
+    cmd = [ffmpeg_exe(), "-y", "-loglevel", "error",
+           "-filter_complex_threads", "1", "-threads", "1", *bg_input,
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{OUTPUT_W}x{OUTPUT_H}", "-r", str(FPS), "-i", "-",
            "-loop", "1", "-framerate", str(FPS), "-i", overlay_png,
            *extra_inputs,
            "-i", audio_path,
            "-filter_complex", graph, "-map", "[v]", "-map", f"{audio_idx}:a", "-t", f"{n_frames / FPS:.6f}",
-           "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p", "-r", str(FPS),
+           "-c:v", "libx264", "-threads:v", "1", "-preset", X264_PRESET,
+           "-pix_fmt", "yuv420p", "-r", str(FPS),
            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
 
-    base_tick, base, last_key, frame = None, None, None, None
+    base_tick, base, last_key, frame, encoded_frame = None, None, None, None, None
     with tempfile.TemporaryFile() as err_file:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err_file)
         try:
             for i in range(n_frames):
+                if i and i % (FPS * 8) == 0:
+                    log_memory(f"render {i / FPS:.0f}s/{duration:.0f}s")
                 tick = int(i / FPS * CHART_RENDER_FPS + 1e-6)
                 key = (tick, int(cap_for_frame[i]))
                 if key != last_key:                       # otherwise the previous frame is sent again
@@ -1208,8 +1304,14 @@ def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png
                         blend_sprite_over(frame, sprites[key[1]])
                     else:
                         frame = base
+                    if scale == 1:
+                        encoded_frame = frame
+                    else:
+                        # Downsize the composite once per unique frame, not every 1/FPS repeat.
+                        encoded_frame = Image.fromarray(frame).resize(
+                            (OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR).tobytes()
                     last_key = key
-                proc.stdin.write(frame)
+                proc.stdin.write(encoded_frame)
             proc.stdin.close()
             proc.wait()
         except BrokenPipeError:
@@ -1235,9 +1337,9 @@ def create_stock_short(upload: bool = False, test: bool = False,
                        on_preview: Optional[Callable[[str], None]] = None) -> str:
     work_dir = Path(tempfile.mkdtemp(prefix="stock_short_"))
     try:
-        # ---- Phase A: data + audio. Independent network calls overlap; Whisper loads in the background ----
+        # ---- Phase A: data + audio. ML models run sequentially in isolated processes. ----
+        log_memory("pipeline start")
         with ThreadPoolExecutor(max_workers=1) as pool:
-            whisper_future = pool.submit(get_whisper_model)
 
             stock_data = get_top_moving_stock(test=test)
             symbol = stock_data["symbol"]
@@ -1258,7 +1360,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
             audio_file = work_dir / "voiceover.wav"   # Piper writes WAV
             duration = generate_voiceovers([(script_data["voiceover_text"], audio_file)])[0]
 
-            whisper_future.result()
+            # Whisper is launched only after Kokoro has exited, so their RAM never overlaps.
             words = transcribe_words(str(audio_file))
             stock_data["logo_path"] = logo_f.result()                # None -> header is drawn without a logo
             overlay_png = create_overlay_graphics(script_data, stock_data, str(work_dir / "overlay.png"))
@@ -1268,6 +1370,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
         logger.info(f"Market metrics: {market_metrics}")
 
         # ---- Phase B: render ----
+        log_memory("before video renderer")
         logger.info(f"📊 Rendering {len(words)} highlighted words + animated chart ({duration:.1f}s)...")
         chart = ChartRenderer(stock_data, duration, market_metrics)
         active_color = (C_UP if stock_data["change_pct"] >= 0 else C_DOWN) if CAPTION_ACTIVE_BY_DIRECTION \
@@ -1276,6 +1379,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
         output_filename = f"STOCK_{symbol}_{int(stock_data['change_pct'])}pct.mp4"
         render_video(chart, sprites, overlay_png, pick_background_video(), str(audio_file), duration,
                      output_filename, news_card=news_card)
+        log_memory("after video renderer")
         logger.info(f"✅ SUCCESS! Video saved as: {output_filename}")
 
         if on_preview:
@@ -1285,6 +1389,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
 
         # ---- Phase C: upload ----
         if upload:
+            from uploader import upload_video  # defer potentially heavy dependency until actually needed
             tags = script_data.get("tags")
             if isinstance(tags, str):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -1312,4 +1417,16 @@ def view_final_video() -> str:
 
 
 if __name__ == "__main__":
-    create_stock_short(upload=False)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--tts-worker":
+        if len(sys.argv) != 4:
+            raise SystemExit("Usage: --tts-worker input.json output.json")
+        payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        result = _generate_voiceovers_in_worker(payload)
+        Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--whisper-worker":
+        if len(sys.argv) != 4:
+            raise SystemExit("Usage: --whisper-worker input.wav output.json")
+        result = _transcribe_words_in_worker(sys.argv[2])
+        Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
+    else:
+        create_stock_short(upload=False)
