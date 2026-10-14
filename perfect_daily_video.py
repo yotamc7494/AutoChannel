@@ -447,7 +447,7 @@ def run_perfect_pipeline(
         final_description = (script_schema.description + chapters_text).strip()
 
         # === חלק 7: איחוד והפקת סרטון סופי ===
-        final_video = concatenate_videoclips([intro_clip] + stock_clips + [outro_clip])
+        final_video = concatenate_videoclips([intro_clip])# + stock_clips + [outro_clip])
 
         if bg_music_path and os.path.exists(bg_music_path):
             logger.info("🎵 Mixing background music...")
