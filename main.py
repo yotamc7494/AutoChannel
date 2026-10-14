@@ -7,12 +7,13 @@ Stages
     3. LLM              (Gemini with model rotation + backoff)
     4. Stock selection  (Redis "used today" set, one batch download, news, company name)
     5. Market metrics   (market cap / S&P 500 / BTC, fetched concurrently, multiple fallbacks)
-    6. Script           (Gemini JSON: title, headline, voiceover, description, tags)
+    6. Script           (Gemini JSON: title, headline, voiceover, description, tags, catalyst_sentences)
     7. TTS              (Piper, local)
-    8. Captions         (Whisper word timestamps -> 2-word captions)
-    9. Graphics         (headline/price overlay PNG, caption sprites)
+    8. Word timings     (Whisper word timestamps)
+    9. Graphics         (header with logo + headline/price overlay PNG, word-highlight caption sprites,
+                         news headline popup card PNG)
    10. Animated chart   (built once, redrawn with blitting)
-   11. Video render     (frames piped to ffmpeg, which does the background/dim/overlay/encode)
+   11. Video render     (frames piped to ffmpeg, which does the background/dim/overlays/news-card slide/encode)
    12. Pipeline + entry points
 
 Dependencies: numpy, scipy, matplotlib, Pillow, yfinance, openai-whisper, google-genai, upstash-redis,
@@ -34,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -47,7 +49,11 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Polygon
 from PIL import Image, ImageDraw, ImageFont
 from scipy.interpolate import PchipInterpolator
+import soundfile as sf
+from kokoro import KPipeline
 
+# Global pipeline initialization (loads model once)
+_kokoro_pipeline = None
 try:
     import httpx  # installed with google-genai; used to recognise network errors
 except ImportError:  # pragma: no cover
@@ -73,6 +79,23 @@ BG_VIDEO_DIR = "assets/trading_floor_videos"
 X264_PRESET = "ultrafast"
 CHART_POINTS = 600                 # smooth-path resolution (PCHIP interpolation)
 
+# --- Logos ---
+LOGOS_DIR = "assets/logos"         # downloaded logos are cached here as <TICKER>.png
+
+# --- Captions (active-word highlight) ---
+CAPTION_FONT_SIZE = 52
+CAPTION_INACTIVE_COLOR = "#FFFFFF"  # words not being spoken right now
+CAPTION_ACTIVE_COLOR = "#FFE600"    # the word being spoken right now
+CAPTION_ACTIVE_BY_DIRECTION = False  # True -> active word is green (stock up) / red (stock down) instead
+
+# --- News headline popup card ---
+NEWS_CARD_LABEL = "LATEST NEWS"    # change to "BREAKING NEWS" if your feed is always fresh
+NEWS_CARD_X = 60                   # resting x position (card is 960px wide, slides in from the right)
+NEWS_CARD_Y = 1110                 # sits between the price badge and the captions
+NEWS_CARD_SLIDE = 0.35             # slide in / out duration in seconds
+NEWS_CARD_START = 0.35             # card appears this many seconds into the video
+NEWS_CARD_MIN_LEN, NEWS_CARD_MAX_LEN = 3.5, 12.0
+
 # --- LLM ---
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite"]   # tried in order, per round
 LLM_MAX_ROUNDS = 5
@@ -80,11 +103,6 @@ LLM_BASE_DELAY = 2.0
 LLM_MAX_DELAY = 30.0
 LLM_RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 
-# --- TTS (Piper) - keep the values you already use ---
-PIPER_MODEL_FILE = "en_US-ryan-high.onnx"
-PIPER_CONFIG_FILE = "en_US-ryan-high.onnx.json"
-PIPER_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx"
-PIPER_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx.json"
         # <1 = faster speech (~ the old "+15%"). Set to None to use the voice default.
 
 # --- Data ---
@@ -172,6 +190,14 @@ def audio_duration(path: str) -> float:
 def mpl_safe(text: str) -> str:
     """A pair of bare '$' makes matplotlib switch to math mode ('$6,800 | BTC: $70,000' breaks)."""
     return text.replace("$", r"\$")
+
+
+def ascii_clean(text: str) -> str:
+    """Normalises typographic characters and drops anything the bold fonts may not render (emoji etc.)."""
+    for src, dst in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'),
+                     ("\u2013", "-"), ("\u2014", "-"), ("\u2026", "...")):
+        text = text.replace(src, dst)
+    return re.sub(r"\s+", " ", re.sub(r"[^\x20-\x7E]+", "", text)).strip()
 
 
 # =====================================================================
@@ -339,33 +365,55 @@ def get_top_moving_stock(test: bool = False) -> dict:
     return best
 
 
-def extract_news_context(news_data, max_articles: int = 3) -> str:
-    """Headlines + summaries from yfinance's news structure."""
+def extract_news_items(news_data, max_articles: int = 3) -> List[dict]:
+    """Structured articles [{provider, title, summary}] from yfinance's news structure."""
     if not news_data or not isinstance(news_data, list):
-        return "No recent breaking news available."
-    articles = []
+        return []
+    items = []
     for item in news_data:
-        if len(articles) >= max_articles:
+        if len(items) >= max_articles:
             break
         content = item.get("content", {}) or {}
         title = (content.get("title") or "").strip()
         if not title:
             continue
-        summary = (content.get("summary") or "").strip()
-        provider = (content.get("provider") or {}).get("displayName", "Market News")
-        text = f"• [{provider}] {title}"
-        if summary:
-            text += f"\n  Context: {summary}"
-        articles.append(text)
-    return "\n\n".join(articles) if articles else "No breaking news found for this ticker today. "
+        items.append({
+            "provider": (content.get("provider") or {}).get("displayName", "Market News"),
+            "title": title,
+            "summary": (content.get("summary") or "").strip(),
+        })
+    return items
 
 
-def fetch_news_context(symbol: str) -> str:
+def format_news_context(items: List[dict]) -> str:
+    """Prompt-ready text for the LLM (this is what ends up in stock_data['news'])."""
+    if not items:
+        return "No recent breaking news available."
+    blocks = []
+    for it in items:
+        text = f"• [{it['provider']}] {it['title']}"
+        if it["summary"]:
+            text += f"\n  Context: {it['summary']}"
+        blocks.append(text)
+    return "\n\n".join(blocks)
+
+
+def extract_news_context(news_data, max_articles: int = 3) -> str:
+    """Headlines + summaries from yfinance's news structure (kept for backwards compatibility)."""
+    items = extract_news_items(news_data, max_articles)
+    if not items and news_data and isinstance(news_data, list):
+        return "No breaking news found for this ticker today. "
+    return format_news_context(items)
+
+
+def fetch_news_context(symbol: str) -> Tuple[str, List[dict]]:
+    """Returns (prompt text, structured items). The items feed the on-screen news card."""
     try:
-        return extract_news_context(yf.Ticker(symbol).news)
+        items = extract_news_items(yf.Ticker(symbol).news)
+        return format_news_context(items), items
     except Exception as e:
         logger.warning(f"⚠️ Could not fetch news for {symbol}: {e}")
-        return "No recent breaking news available."
+        return "No recent breaking news available.", []
 
 
 def get_company_name(symbol: str) -> str:
@@ -376,6 +424,48 @@ def get_company_name(symbol: str) -> str:
         return info.get("longName") or info.get("shortName") or symbol
     except Exception:
         return symbol
+
+
+def get_ticker_logo(ticker):
+    """Downloads a transparent logo automatically from a CDN, validating the file."""
+    os.makedirs(LOGOS_DIR, exist_ok=True)
+    logo_path = os.path.join(LOGOS_DIR, f"{ticker}.png")
+
+    if os.path.exists(logo_path):
+        try:
+            with Image.open(logo_path) as img:
+                img.verify()
+            return logo_path
+        except Exception:
+            try:
+                os.remove(logo_path)
+            except Exception:
+                pass
+
+    urls = [
+        f"https://assets.parqet.com/logos/symbol/{ticker}",
+        f"https://financialmodelingprep.com/image-stock/{ticker}.png",
+        f"https://logo.clearbit.com/{ticker.lower()}.com",
+    ]
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read()
+                if len(data) < 500:
+                    continue
+                img = Image.open(BytesIO(data))
+                img.verify()
+                img = Image.open(BytesIO(data)).convert("RGBA")
+                img.save(logo_path, "PNG")
+                return logo_path
+        except Exception:
+            continue
+
+    return None
 
 
 # =====================================================================
@@ -500,13 +590,14 @@ def _parse_script(response) -> dict:
 
 
 def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
+    direction = "UP" if stock_data["change_pct"] >= 0 else "DOWN"
     prompt = f"""
         You are a high-energy financial content creator and YouTube SEO expert for TikTok, YouTube Shorts, and Instagram Reels.
         Create a fast-paced 45-second video script and SEO-optimized metadata about this stock movement:
         - Symbol: {stock_data['symbol']}
         - Company Name: {stock_data['company_name']}
         - Current Price: ${stock_data['current_price']}
-        - Today's Change: {stock_data['change_pct']}%
+        - Today's Change: {stock_data['change_pct']}% (the stock is {direction} today)
         - News Context: {stock_data['news']}
 
         CRITICAL SCRIPTING & SEO RULES:
@@ -515,31 +606,40 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
            - "description" MUST naturally incorporate both the ticker and company name alongside key financial terms.
            - "tags" MUST include the ticker, company name, specific stock tags (e.g., AVGO, Broadcom, BroadcomStock), and general investing tags.
 
-        2. SCROLL-STOPPING HOOK:
-           - Start instantly with a high-stakes, dramatic statement in the first 2 seconds that calls out the specific stock and its movement.
+        2. IMMEDIATE ANSWER HOOK (FIRST 3 SECONDS):
+           - The FIRST sentence must immediately say WHAT the stock did and WHY it moved today, using the real reason found in the News Context above. Example shape: "Nvidia just dropped more than 5 percent today because [the actual reason from the news]."
+           - Use the company's plain name (not just the ticker) in that first sentence.
+           - NO generic high-stakes filler, NO vague teasers like "you won't believe what happened". The first sentence must carry real substance.
+           - NEVER invent a catalyst. If the News Context contains no clear reason, say the stock is moving sharply today and honestly note that no single headline explains it yet, then give the most relevant market-wide factor.
 
         3. POLARIZING STORYTELLING & MARKET CONTROVERSY (BULL VS. BEAR):
-           - Show the tension: Explain why the Bears think this stock is heading for a crash, while the Bulls argue it is a lifetime opportunity.
+           - After the catalyst, show the tension: Explain why the Bears think this stock is heading for a crash, while the Bulls argue it is a lifetime opportunity.
            - Focus on big market forces, macro trends, and major institutions (Wall Street, Big Tech, The Fed) rather than obscure individuals.
 
         4. OPTIMIZED FOR TTS (RETENTION & FLOW):
            - Write purely in natural, spoken English.
            - ABSOLUTELY NO dashes (-), ellipses (...), semicolons (;), or complex formatting that causes Text-To-Speech (TTS) engines to pause awkwardly.
-           - Keep punctuation strictly to simple periods and commas for a relentless, fast pace.
-           - Do not use ndecimal points and number after for example insted of (+1.64% say the stock is up by more the 1 percent, same for prices)
+           - Keep punctuation strictly to simple periods, commas and the final question mark, for a relentless, fast pace.
+           - Do not use decimal points. Round everything to speakable numbers. For example, instead of "+1.64%" say "the stock is up by more than 1 percent", and do the same for prices.
+           - Avoid abbreviations that contain periods (write "US" not "U.S.").
 
-        5. HIGH-ENGAGEMENT BINARY CTA (COMMENT MAGNET):
-           - End the script immediately with an intense, forced binary choice question that triggers emotional responses.
-           - Force the viewer to pick a side in the comments using a simple word choice (e.g., "Is this a massive trap or an easy bargain? Type BUY or SELL in the comments right now!").
+        5. HIGH-ENGAGEMENT PRICE TARGET CTA (COMMENT MAGNET):
+           - End the script with a direct question asking viewers for their PRICE TARGET or their AVERAGE BUY PRICE for {stock_data['symbol']}.
+           - Example: "What is your price target for {stock_data['symbol']}? Drop your target or average buy price in the comments right now!"
+           - Do NOT use the generic "Type BUY or SELL" call to action. You may vary the wording, but it must ask for a price target or a buy price.
 
-        6. STRICT OUTPUT FORMAT:
-           - Return ONLY a valid JSON object with the following 5 fields:
+        6. CATALYST SEGMENT MARKER:
+           - "catalyst_sentences" is an integer (1 or 2): how many of the OPENING sentences of the voiceover explain the news catalyst. The video shows a news headline card during exactly that part.
+
+        7. STRICT OUTPUT FORMAT:
+           - Return ONLY a valid JSON object with the following 6 fields:
         {{
           "youtube_title": "High-CTR & Search-Optimized title with TICKER + COMPANY NAME + Emojis",
           "overlay_headline": "2 to 4 WORDS IN ALL CAPS FOR ON-SCREEN OVERLAY (e.g., AVGO HUGE CRASH!)",
-          "voiceover_text": "The full fluid script for narration with a controversial story beat and binary CTA",
-          "description": "SEO-rich summary with Ticker and Company Name, ending with a strong call to debate in the comments",
-          "tags": "5-7 relevant tags separated by commas including Ticker and Full Company Name"
+          "voiceover_text": "The full fluid script: immediate why-it-moved hook, bull vs bear story beat, price target CTA",
+          "description": "SEO-rich summary with Ticker and Company Name, ending with a call to share your price target in the comments",
+          "tags": "5-7 relevant tags separated by commas including Ticker and Full Company Name",
+          "catalyst_sentences": 1
         }}
         """
     return ask_llm(prompt, config=types.GenerateContentConfig(response_mime_type="application/json"),
@@ -547,15 +647,15 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
 
 
 # =====================================================================
-# 7. TEXT-TO-SPEECH  (Piper, local)
+# 7. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
-def ensure_piper_model():
-    """Downloads the voice model once if it is not already in the local folder."""
-    if not os.path.exists(PIPER_MODEL_FILE) or not os.path.exists(PIPER_CONFIG_FILE):
-        logger.info("Downloading Piper voice model (one-time setup)...")
-        urllib.request.urlretrieve(PIPER_MODEL_URL, PIPER_MODEL_FILE)
-        urllib.request.urlretrieve(PIPER_CONFIG_URL, PIPER_CONFIG_FILE)
-        logger.info("✅ Piper voice model ready!")
+
+def get_kokoro_pipeline():
+    global _kokoro_pipeline
+    if _kokoro_pipeline is None:
+        logger.info("Initializing Kokoro-82M TTS Pipeline...")
+        _kokoro_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+    return _kokoro_pipeline
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -570,31 +670,41 @@ def clean_script_for_tts(text: str) -> str:
 
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
     """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
-    logger.info(f"Generating {len(items)} TTS clips locally with Piper...")
+    logger.info(f"Generating {len(items)} TTS clips locally with Kokoro-82M (Voice: am_liam)...")
+    pipeline = get_kokoro_pipeline()
     durations = []
-    ensure_piper_model()
 
     for text, path in items:
         clean_text = clean_script_for_tts(text)
         path_str = str(path)
-        logger.info(f"Generating TTS audio: {Path(path_str).name}")
+        logger.info(f"Generating Kokoro audio: {Path(path_str).name}")
 
-        # the text is piped through stdin, so no shell quoting problems
-        cmd = ["piper", "--model", PIPER_MODEL_FILE, "--output_file", path_str]
-        proc = subprocess.run(cmd, input=clean_text.encode('utf-8'), capture_output=True)
+        generator = pipeline(
+            clean_text,
+            voice='am_liam',   # Selected voice
+            speed=1.1,         # Fast speed for shorts
+            split_pattern=r'\n+'
+        )
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"Piper TTS failed for {path_str}: {proc.stderr.decode(errors='ignore')}")
+        all_audio = []
+        for _, _, audio in generator:
+            all_audio.append(audio)
+
+        if not all_audio:
+            raise RuntimeError(f"Kokoro failed to generate audio for {path_str}")
+
+        final_audio = np.concatenate(all_audio)
+        sf.write(path_str, final_audio, 24000)  # Kokoro uses 24kHz sample rate
 
         dur = audio_duration(path_str)
         durations.append(dur)
-        logger.info(f"✅ Created: {Path(path_str).name} ({dur:.2f}s)")
+        logger.info(f"✅ Created with Kokoro: {Path(path_str).name} ({dur:.2f}s)")
 
     return durations
 
 
 # =====================================================================
-# 8. CAPTIONS (Whisper word timestamps)
+# 8. WORD TIMINGS (Whisper word timestamps)
 # =====================================================================
 @lru_cache(maxsize=1)
 def get_whisper_model():
@@ -603,26 +713,45 @@ def get_whisper_model():
     return whisper.load_model("tiny.en")
 
 
-def get_exact_captions_with_whisper(audio_file: str, words_per_caption: int = 2) -> List[dict]:
-    logger.info("🎧 Aligning captions with Whisper...")
+def transcribe_words(audio_file: str) -> List[dict]:
+    """
+    Word-level timings: [{"raw", "text", "start", "end"}].
+    `raw` keeps Whisper's punctuation (used to find sentence ends), `text` is the caption-ready word.
+    """
+    logger.info("🎧 Aligning words with Whisper...")
     # Whisper accepts a 16 kHz float32 array, so it never needs an ffmpeg executable on PATH.
     audio = decode_audio(audio_file, sr=16000)
     result = get_whisper_model().transcribe(audio, word_timestamps=True)
 
-    words = [{"word": w["word"].strip(), "start": w["start"], "end": w["end"]}
-             for seg in result.get("segments", []) for w in seg.get("words", [])]
-    captions = []
-    for i in range(0, len(words), words_per_caption):
-        group = words[i:i + words_per_caption]
-        start, end = group[0]["start"], group[-1]["end"]
-        if i + words_per_caption < len(words):
-            end = min(end + 0.05, words[i + words_per_caption]["start"])
-        captions.append({"start": start, "end": end, "text": " ".join(w["word"] for w in group)})
-    return captions
+    words = []
+    for seg in result.get("segments", []):
+        for w in seg.get("words", []):
+            raw = w["word"].strip()
+            text = re.sub(r"^[^\w$%]+|[^\w$%]+$", "", raw)   # captions look cleaner without edge punctuation
+            words.append({"raw": raw, "text": text, "start": float(w["start"]), "end": float(w["end"])})
+    return words
+
+
+def catalyst_window(words: List[dict], n_sentences: int, duration: float) -> Tuple[float, float]:
+    """Time window during which the script talks about the catalyst: from the start until the end of the
+    n-th sentence (detected from sentence-ending punctuation in Whisper's output)."""
+    start = NEWS_CARD_START
+    end = None
+    count = 0
+    for w in words:
+        if re.search(r"[.!?][\"')\]]*$", w["raw"]):
+            count += 1
+            if count >= n_sentences:
+                end = w["end"] + 0.2
+                break
+    if end is None:                                   # no punctuation found: fall back to ~7 seconds
+        end = min(duration, 7.0)
+    end = min(max(end, start + NEWS_CARD_MIN_LEN), start + NEWS_CARD_MAX_LEN, duration - 0.1)
+    return start, end
 
 
 # =====================================================================
-# 9. GRAPHICS  (overlay PNG + caption sprites, pre-rendered once)
+# 9. GRAPHICS  (header + overlay PNG, news card PNG, word-highlight caption sprites)
 # =====================================================================
 @lru_cache(maxsize=16)
 def load_system_font(size: int):
@@ -650,9 +779,79 @@ def load_system_font(size: int):
         return ImageFont.load_default()
 
 
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: float) -> str:
+    """Shortens text with '...' until it fits max_width."""
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while len(text) > 1 and draw.textlength(text + "...", font=font) > max_width:
+        text = text[:-1]
+    return text.rstrip() + "..."
+
+
+def prepare_logo(path: Optional[str], size: int) -> Optional[Tuple[Image.Image, float]]:
+    """Trims transparent borders, pads to a square with transparent padding and resizes.
+    Returns (RGBA logo of size x size, mean luminance of its visible pixels) or None."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        img = Image.open(path).convert("RGBA")
+        bbox = img.getchannel("A").getbbox()
+        if not bbox:
+            return None
+        img = img.crop(bbox)
+        side = max(img.size)
+        square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        square.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
+        square = square.resize((size, size), Image.Resampling.LANCZOS)
+        arr = np.asarray(square).astype(np.float32)
+        mask = arr[:, :, 3] > 40
+        lum = float((0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2])[mask].mean()) \
+            if mask.any() else 0.0
+        return square, lum
+    except Exception as e:
+        logger.warning(f"⚠️ Could not process logo {path}: {e}")
+        return None
+
+
+def draw_header_banner(canvas: Image.Image, stock_data: dict, logo_path: Optional[str], accent: str) -> None:
+    """Top header: [logo tile]  TICKER / Company name. Sits above the chart area (y 60..210)."""
+    w, h = 960, 150
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle((0, 0, w - 1, h - 1), radius=32, fill=(20, 26, 38, 238), outline=accent, width=3)
+
+    text_x = 40
+    logo = prepare_logo(logo_path, 104)
+    if logo:
+        sq, lum = logo
+        tile_size = 132
+        # white logos get a dark tile, everything else a white tile so it always stays readable
+        tile_color = (30, 38, 51, 255) if lum > 215 else (255, 255, 255, 255)
+        tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+        ImageDraw.Draw(tile).rounded_rectangle((0, 0, tile_size - 1, tile_size - 1), radius=26, fill=tile_color)
+        tile.alpha_composite(sq, ((tile_size - 104) // 2, (tile_size - 104) // 2))
+        layer.alpha_composite(tile, (24, (h - tile_size) // 2))
+        text_x = 24 + tile_size + 28
+
+    max_w = w - text_x - 30
+    ticker_font, name_font = load_system_font(68), load_system_font(34)
+    ticker = _fit_text(d, stock_data["symbol"], ticker_font, max_w)
+    name = _fit_text(d, ascii_clean(stock_data.get("company_name", "")), name_font, max_w)
+    d.text((text_x, int(h * 0.38)), ticker, font=ticker_font, fill="white", anchor="lm")
+    d.text((text_x, int(h * 0.76)), name, font=name_font, fill="#9AA7BD", anchor="lm")
+
+    canvas.alpha_composite(layer, ((canvas.width - w) // 2, 60))
+
+
 def create_overlay_graphics(script_data: dict, stock_data: dict, output_path: str,
                             canvas_size: Tuple[int, int] = (VIDEO_W, VIDEO_H)) -> str:
     canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    pct = stock_data["change_pct"]
+
+    # ---- header banner: logo + ticker + company name ----
+    if "logo_path" not in stock_data:            # normally prefetched in the thread pool
+        stock_data["logo_path"] = get_ticker_logo(stock_data["symbol"])
+    draw_header_banner(canvas, stock_data, stock_data.get("logo_path"), C_UP if pct >= 0 else C_DOWN)
 
     headline = script_data.get("overlay_headline", f"{stock_data['symbol']} MOVES!").upper()
     font = load_system_font(75 if len(headline) < 15 else 60)
@@ -669,7 +868,6 @@ def create_overlay_graphics(script_data: dict, stock_data: dict, output_path: st
     rotated = text_img.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
     canvas.paste(rotated, (int((canvas_size[0] - rotated.width) / 2), 380), rotated)  # just under the top banners
 
-    pct = stock_data["change_pct"]
     pct_text = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
     pct_color = "#00E676" if pct >= 0 else "#FF1744"
     price_text = f"${stock_data['current_price']:.2f}"
@@ -689,6 +887,83 @@ def create_overlay_graphics(script_data: dict, stock_data: dict, output_path: st
     return output_path
 
 
+# ---------------- News headline popup card ----------------
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: float, max_lines: int) -> List[str]:
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}".strip()
+        if draw.textlength(trial, font=font) <= max_w:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and draw.textlength(last + "...", font=font) > max_w:
+            last = last.rsplit(" ", 1)[0] if " " in last else last[:-1]
+        lines[-1] = last + "..."
+    return lines
+
+
+def create_news_card(item: dict, change_pct: float, output_path: str, width: int = 960) -> Optional[str]:
+    """Styled 'news headline' card (transparent PNG). No dates/timestamps are drawn."""
+    title = ascii_clean(item.get("title", ""))
+    if len(title) < 10:
+        return None
+    provider = ascii_clean(item.get("provider", "")) or "Market News"
+    accent = C_UP if change_pct >= 0 else C_DOWN
+
+    pad, pill_h, line_h = 36, 50, 58
+    label_font, prov_font, title_font = load_system_font(28), load_system_font(28), load_system_font(46)
+    probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
+    lines = _wrap_text(probe, title, title_font, width - 2 * pad - 8, max_lines=3)
+    height = pad + pill_h + 24 + line_h * len(lines) + pad - 8
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, width - 1, height - 1), radius=30, fill=(20, 26, 38, 244), outline=accent, width=4)
+
+    # label pill (top-left) + source (top-right)
+    label_w = int(d.textlength(NEWS_CARD_LABEL, font=label_font)) + 40
+    d.rounded_rectangle((pad, pad, pad + label_w, pad + pill_h), radius=pill_h // 2, fill="#FF1744")
+    d.text((pad + label_w // 2, pad + pill_h // 2), NEWS_CARD_LABEL, font=label_font, fill="white", anchor="mm")
+    prov = _fit_text(d, provider, prov_font, width - 2 * pad - label_w - 30)
+    d.text((width - pad, pad + pill_h // 2), prov, font=prov_font, fill="#9AA7BD", anchor="rm")
+
+    # headline
+    y = pad + pill_h + 24
+    for line in lines:
+        d.text((pad, y), line, font=title_font, fill="white", anchor="lt")
+        y += line_h
+
+    img.save(output_path)
+    return output_path
+
+
+def build_news_card_plan(stock_data: dict, script_data: dict, words: List[dict], duration: float,
+                         out_path: str) -> Optional[Tuple[str, float, float]]:
+    """(png_path, start, end) for the news card, or None when there is no usable headline."""
+    items = stock_data.get("news_items") or []
+    if not items:
+        logger.info("📰 No news headline available - skipping the news card.")
+        return None
+    png = create_news_card(items[0], stock_data["change_pct"], out_path)
+    if not png:
+        return None
+    try:
+        n_sentences = max(1, min(3, int(script_data.get("catalyst_sentences") or 2)))
+    except (TypeError, ValueError):
+        n_sentences = 2
+    start, end = catalyst_window(words, n_sentences, duration)
+    logger.info(f"📰 News card: {start:.2f}s -> {end:.2f}s (catalyst = first {n_sentences} sentence(s))")
+    return png, start, end
+
+
+# ---------------- Word-highlight captions ----------------
 @dataclass
 class CaptionSprite:
     start: float
@@ -698,27 +973,65 @@ class CaptionSprite:
     rgba: np.ndarray   # (h, w, 4) uint8, straight alpha, cropped to the text
 
 
-def build_caption_sprites(captions: List[dict], box: Tuple[int, int] = (1000, 220), top: int = 1420) -> List[CaptionSprite]:
-    """One small sprite per caption, rendered once (no temp PNG files, no per-caption clips)."""
-    font = load_system_font(52)
+def build_caption_sprites(words: List[dict], words_per_caption: int = 2,
+                          box: Tuple[int, int] = (1000, 220), top: int = 1420,
+                          active_color: str = CAPTION_ACTIVE_COLOR,
+                          inactive_color: str = CAPTION_INACTIVE_COLOR) -> List[CaptionSprite]:
+    """
+    Groups words into captions of `words_per_caption`, then renders ONE sprite per spoken word: the same
+    layout every time, with only the currently spoken word in `active_color`. Sprites are strictly
+    time-ordered and non-overlapping, so the renderer can pick one per frame. Everything is pre-rendered once.
+    """
+    spoken = [w for w in words if w["text"]]
     box_x = (VIDEO_W - box[0]) // 2
-    sprites = []
-    for cap in captions:
-        if cap["end"] - cap["start"] <= 0.05:
-            continue
-        img = Image.new("RGBA", box, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        text = cap["text"].upper()
-        bbox = draw.textbbox((0, 0), text, font=font)
-        draw.text(((box[0] - (bbox[2] - bbox[0])) / 2, (box[1] - (bbox[3] - bbox[1])) / 2), text, font=font,
-                  fill="#FFE600", stroke_width=8, stroke_fill="black")
-        arr = np.asarray(img)
-        rows, cols = np.where(arr[:, :, 3] > 0)
-        if len(rows) == 0:
-            continue
-        y0, y1, x0, x1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
-        sprites.append(CaptionSprite(cap["start"], cap["end"], box_x + int(x0), top + int(y0),
-                                     np.ascontiguousarray(arr[y0:y1, x0:x1])))
+    sprites: List[CaptionSprite] = []
+    last_end = 0.0
+
+    for g in range(0, len(spoken), words_per_caption):
+        group = spoken[g:g + words_per_caption]
+        texts = [w["text"].upper() for w in group]
+
+        group_end = group[-1]["end"]
+        if g + words_per_caption < len(spoken):                       # keep a tiny tail, never overlap the next
+            group_end = min(group_end + 0.05, spoken[g + words_per_caption]["start"])
+
+        # shared layout: shrink the font until the whole caption fits the box
+        size = CAPTION_FONT_SIZE
+        while True:
+            font = load_system_font(size)
+            probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+            space = probe.textlength(" ", font=font)
+            widths = [probe.textlength(t, font=font) for t in texts]
+            total = sum(widths) + space * (len(texts) - 1)
+            if total <= box[0] - 40 or size <= 28:
+                break
+            size -= 4
+        x = (box[0] - total) / 2
+        xs = []
+        for wd in widths:
+            xs.append(x)
+            x += wd + space
+
+        for j, word in enumerate(group):
+            t0 = max(word["start"], last_end)
+            t1 = group[j + 1]["start"] if j + 1 < len(group) else group_end
+            if t1 - t0 <= 0.02:
+                continue
+
+            img = Image.new("RGBA", box, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            for k, t in enumerate(texts):
+                draw.text((xs[k], box[1] / 2), t, font=font, anchor="lm",
+                          fill=active_color if k == j else inactive_color,
+                          stroke_width=8, stroke_fill="black")
+            arr = np.asarray(img)
+            rows, cols = np.where(arr[:, :, 3] > 0)
+            if len(rows) == 0:
+                continue
+            y0, y1, x0, x1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+            sprites.append(CaptionSprite(t0, t1, box_x + int(x0), top + int(y0),
+                                         np.ascontiguousarray(arr[y0:y1, x0:x1])))
+            last_end = t1
     return sprites
 
 
@@ -833,11 +1146,22 @@ def pick_background_video() -> Optional[str]:
     return str(random.choice(files))
 
 
+def _news_card_overlay(start: float, end: float) -> str:
+    """ffmpeg overlay filter: card slides in from the right at `start`, slides back out before `end`.
+    Done inside ffmpeg (no per-frame Python work)."""
+    s = NEWS_CARD_SLIDE
+    p_in = f"clip((t-{start:.3f})/{s},0,1)"
+    p_out = f"clip((t-{end - s:.3f})/{s},0,1)"
+    x = f"{NEWS_CARD_X}+({VIDEO_W}-{NEWS_CARD_X})*(pow(1-{p_in},2)+pow({p_out},2))"   # ease-out in, ease-in out
+    return f"overlay=x='{x}':y={NEWS_CARD_Y}:enable='between(t,{start:.3f},{end:.3f})':format=auto"
+
+
 def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png: str, bg_path: Optional[str],
-                 audio_path: str, duration: float, out_path: str) -> None:
+                 audio_path: str, duration: float, out_path: str,
+                 news_card: Optional[Tuple[str, float, float]] = None) -> None:
     n_frames = max(1, round(duration * FPS))
 
-    # which caption is visible on each output frame (-1 = none)
+    # which caption sprite is visible on each output frame (-1 = none)
     cap_for_frame = np.full(n_frames, -1, dtype=np.int32)
     for i, s in enumerate(sprites):
         f0 = int(math.ceil(s.start * FPS - 1e-9))
@@ -846,15 +1170,27 @@ def render_video(chart: ChartRenderer, sprites: List[CaptionSprite], overlay_png
 
     bg_input = (["-stream_loop", "-1", "-i", bg_path] if bg_path
                 else ["-f", "lavfi", "-i", f"color=c=0x0B0E14:s={VIDEO_W}x{VIDEO_H}:r={FPS}"])
-    # background: cover-fit to 1080x1920 (scale to height, centre crop), dim; then chart layer, then overlay PNG
+    # background: cover-fit to 1080x1920 (scale to height, centre crop), dim; then chart layer, then overlay PNG,
+    # then (optionally) the sliding news card
     graph = (f"[0:v]fps={FPS},scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
              f"crop={VIDEO_W}:{VIDEO_H},colorchannelmixer=rr={BG_DIM}:gg={BG_DIM}:bb={BG_DIM},setsar=1[bg];"
-             "[bg][1:v]overlay=format=auto[a];[a][2:v]overlay=format=auto[v]")
+             "[bg][1:v]overlay=format=auto[a];")
+    extra_inputs: List[str] = []
+    if news_card:
+        card_png, c_start, c_end = news_card
+        extra_inputs = ["-loop", "1", "-framerate", str(FPS), "-i", card_png]
+        graph += f"[a][2:v]overlay=format=auto[b];[b][3:v]{_news_card_overlay(c_start, c_end)}[v]"
+        audio_idx = 4
+    else:
+        graph += "[a][2:v]overlay=format=auto[v]"
+        audio_idx = 3
+
     cmd = [ffmpeg_exe(), "-y", "-loglevel", "error", *bg_input,
            "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{VIDEO_W}x{VIDEO_H}", "-r", str(FPS), "-i", "-",
            "-loop", "1", "-framerate", str(FPS), "-i", overlay_png,
+           *extra_inputs,
            "-i", audio_path,
-           "-filter_complex", graph, "-map", "[v]", "-map", "3:a", "-t", f"{n_frames / FPS:.6f}",
+           "-filter_complex", graph, "-map", "[v]", "-map", f"{audio_idx}:a", "-t", f"{n_frames / FPS:.6f}",
            "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p", "-r", str(FPS),
            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
 
@@ -908,8 +1244,10 @@ def create_stock_short(upload: bool = False, test: bool = False,
             symbol = stock_data["symbol"]
             news_f = pool.submit(fetch_news_context, symbol)
             name_f = pool.submit(get_company_name, symbol)
+            logo_f = pool.submit(get_ticker_logo, symbol)            # downloads/validates while the LLM works
             metrics_f = pool.submit(fetch_market_metrics, symbol)   # runs while the LLM + TTS work below
-            stock_data["news"], stock_data["company_name"] = news_f.result(), name_f.result()
+            stock_data["news"], stock_data["news_items"] = news_f.result()
+            stock_data["company_name"] = name_f.result()
 
             logger.info("🤖 Generating script...")
             script_data = generate_script_and_titles_with_ai(stock_data)
@@ -922,17 +1260,23 @@ def create_stock_short(upload: bool = False, test: bool = False,
             duration = generate_voiceovers([(script_data["voiceover_text"], audio_file)])[0]
 
             whisper_future.result()
-            captions = get_exact_captions_with_whisper(str(audio_file), words_per_caption=2)
+            words = transcribe_words(str(audio_file))
+            stock_data["logo_path"] = logo_f.result()                # None -> header is drawn without a logo
             overlay_png = create_overlay_graphics(script_data, stock_data, str(work_dir / "overlay.png"))
+            news_card = build_news_card_plan(stock_data, script_data, words, duration,
+                                             str(work_dir / "news_card.png"))
             market_metrics = metrics_f.result()
         logger.info(f"Market metrics: {market_metrics}")
 
         # ---- Phase B: render ----
-        logger.info(f"📊 Rendering {len(captions)} captions + animated chart ({duration:.1f}s)...")
+        logger.info(f"📊 Rendering {len(words)} highlighted words + animated chart ({duration:.1f}s)...")
         chart = ChartRenderer(stock_data, duration, market_metrics)
-        sprites = build_caption_sprites(captions)
+        active_color = (C_UP if stock_data["change_pct"] >= 0 else C_DOWN) if CAPTION_ACTIVE_BY_DIRECTION \
+            else CAPTION_ACTIVE_COLOR
+        sprites = build_caption_sprites(words, words_per_caption=2, active_color=active_color)
         output_filename = f"STOCK_{symbol}_{int(stock_data['change_pct'])}pct.mp4"
-        render_video(chart, sprites, overlay_png, pick_background_video(), str(audio_file), duration, output_filename)
+        render_video(chart, sprites, overlay_png, pick_background_video(), str(audio_file), duration,
+                     output_filename, news_card=news_card)
         logger.info(f"✅ SUCCESS! Video saved as: {output_filename}")
 
         if on_preview:

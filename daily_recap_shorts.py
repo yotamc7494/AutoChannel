@@ -29,7 +29,10 @@ from matplotlib.ticker import FuncFormatter
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 from scipy.interpolate import make_interp_spline
+import soundfile as sf
+from kokoro import KPipeline
 
+_kokoro_pipeline = None
 from uploader import upload_video
 
 load_dotenv()
@@ -65,11 +68,6 @@ IO_WORKERS = 8                         # threads for network calls
 PARALLEL_RENDER = True                 # render each scene in its own process
 MAX_RENDER_WORKERS = os.cpu_count() or 1
 
-# --- TTS ---
-PIPER_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx"
-PIPER_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/high/en_US-ryan-high.onnx.json"
-PIPER_MODEL_FILE = "en_US-ryan-high.onnx"
-PIPER_CONFIG_FILE = "en_US-ryan-high.onnx.json"
 
 # --- Data ---
 RSS_QUERIES = [
@@ -414,15 +412,16 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 
 
 # =====================================================================
-# 6. TEXT-TO-SPEECH
+# 6. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
-def ensure_piper_model():
-    """Downloads the voice model once if it is not already in the local folder."""
-    if not os.path.exists(PIPER_MODEL_FILE) or not os.path.exists(PIPER_CONFIG_FILE):
-        logger.info("Downloading Piper voice model (one-time setup)...")
-        urllib.request.urlretrieve(PIPER_MODEL_URL, PIPER_MODEL_FILE)
-        urllib.request.urlretrieve(PIPER_CONFIG_URL, PIPER_CONFIG_FILE)
-        logger.info("✅ Piper voice model ready!")
+
+
+def get_kokoro_pipeline():
+    global _kokoro_pipeline
+    if _kokoro_pipeline is None:
+        logger.info("Initializing Kokoro-82M TTS Pipeline...")
+        _kokoro_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+    return _kokoro_pipeline
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -437,25 +436,35 @@ def clean_script_for_tts(text: str) -> str:
 
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
     """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
-    logger.info(f"Generating {len(items)} TTS clips locally with Piper...")
+    logger.info(f"Generating {len(items)} TTS clips locally with Kokoro-82M (Voice: am_liam)...")
+    pipeline = get_kokoro_pipeline()
     durations = []
-    ensure_piper_model()
 
     for text, path in items:
         clean_text = clean_script_for_tts(text)
         path_str = str(path)
-        logger.info(f"Generating TTS audio: {Path(path_str).name}")
+        logger.info(f"Generating Kokoro audio: {Path(path_str).name}")
 
-        # the text is piped through stdin, so no shell quoting problems
-        cmd = ["piper", "--model", PIPER_MODEL_FILE, "--output_file", path_str]
-        proc = subprocess.run(cmd, input=clean_text.encode('utf-8'), capture_output=True)
+        generator = pipeline(
+            clean_text,
+            voice='am_liam',   # Selected voice
+            speed=1.1,         # Fast speed for shorts
+            split_pattern=r'\n+'
+        )
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"Piper TTS failed for {path_str}: {proc.stderr.decode(errors='ignore')}")
+        all_audio = []
+        for _, _, audio in generator:
+            all_audio.append(audio)
+
+        if not all_audio:
+            raise RuntimeError(f"Kokoro failed to generate audio for {path_str}")
+
+        final_audio = np.concatenate(all_audio)
+        sf.write(path_str, final_audio, 24000)  # Kokoro uses 24kHz sample rate
 
         dur = audio_duration(path_str)
         durations.append(dur)
-        logger.info(f"✅ Created: {Path(path_str).name} ({dur:.2f}s)")
+        logger.info(f"✅ Created with Kokoro: {Path(path_str).name} ({dur:.2f}s)")
 
     return durations
 
