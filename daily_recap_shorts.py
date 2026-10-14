@@ -415,7 +415,6 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 # 6. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
 
-@st.cache_resource
 def get_kokoro_pipeline():
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
