@@ -1,3 +1,9 @@
+# Patched for low-memory Streamlit deployments.
+# Optional environment settings:
+#   STOCK_APPROX_TIMINGS=1     skips Whisper (estimated subtitle timings)
+#   STOCK_DISABLE_BG_VIDEO=1   eliminates background-video decode cost
+#   STOCK_MEMORY_GUARD_FRACTION=0.92  terminates ML worker before cgroup OOM
+
 """
 Top-moving-stock vertical short (1080x1920)  -  refactored for speed
 
@@ -44,6 +50,98 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+# IMPORTANT: Workers must be dispatched BEFORE importing yfinance, SciPy,
+# matplotlib or Gemini. Otherwise subprocesses duplicate the Streamlit process's
+# scientific stack even though only Kokoro / Whisper is actually needed.
+def _run_lightweight_ml_worker(kind: str, argv: List[str]) -> None:
+    import traceback
+
+    def report(stage: str) -> None:
+        try:
+            kb = next(int(line.split()[1]) for line in Path('/proc/self/status').read_text().splitlines()
+                      if line.startswith('VmRSS:'))
+            cur = Path('/sys/fs/cgroup/memory.current')
+            used = f", container={int(cur.read_text()) / 2**20:.0f} MiB" if cur.exists() else ''
+            print(f"ML WORKER [{kind}/{stage}] RSS={kb / 1024:.0f} MiB{used}", flush=True)
+        except Exception:
+            pass
+
+    report('start')
+    if kind == 'tts':
+        import numpy as np
+        import soundfile as sf
+        import torch
+        from kokoro import KPipeline
+        torch.set_num_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        job_file, result_file = map(Path, argv)
+        items = json.loads(job_file.read_text(encoding='utf-8'))
+        report('before model')
+        pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+        report('model loaded')
+        durations = []
+        with torch.inference_mode():
+            for phrase, out_file in items:
+                chunks = []
+                for _, _, audio in pipeline(phrase, voice='am_liam', speed=1.1,
+                                            split_pattern=r'\n+'):
+                    if hasattr(audio, 'detach'):
+                        audio = audio.detach().cpu().numpy()
+                    chunks.append(np.asarray(audio, dtype=np.float32))
+                if not chunks:
+                    raise RuntimeError('Kokoro returned empty speech')
+                sf.write(out_file, np.concatenate(chunks), 24000)
+                durations.append(float(sf.info(out_file).duration))
+                chunks.clear()
+                report('wrote audio')
+        result_file.write_text(json.dumps(durations), encoding='utf-8')
+        report('complete')
+    elif kind == 'whisper':
+        import numpy as np
+        import whisper
+        audio_file, result_file = argv
+        executable = shutil.which('ffmpeg')
+        if not executable:
+            import imageio_ffmpeg
+            executable = imageio_ffmpeg.get_ffmpeg_exe()
+        decoded = subprocess.run([executable, '-v', 'error', '-i', audio_file,
+                                  '-f', 'f32le', '-ac', '1', '-ar', '16000', '-'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        audio = np.frombuffer(decoded.stdout, dtype=np.float32)
+        report('before model')
+        model = whisper.load_model('tiny.en', device='cpu')
+        report('model loaded')
+        result = model.transcribe(audio, word_timestamps=True, fp16=False,
+                                  beam_size=1, best_of=1, verbose=False)
+        words = []
+        for seg in result.get('segments', []):
+            for w in seg.get('words', []):
+                raw = w['word'].strip()
+                clean = re.sub(r'^[^\w$%]+|[^\w$%]+$', '', raw)
+                words.append({'raw': raw, 'text': clean,
+                              'start': float(w['start']), 'end': float(w['end'])})
+        Path(result_file).write_text(json.dumps(words), encoding='utf-8')
+        report('complete')
+    else:
+        raise ValueError(f'Unknown worker kind: {kind}')
+
+
+if __name__ == '__main__' and len(sys.argv) >= 2 and sys.argv[1] in ('--tts-worker', '--whisper-worker'):
+    kind = sys.argv[1][2:].removesuffix('-worker')
+    expected_args = 2
+    if len(sys.argv) != expected_args + 2:
+        raise SystemExit(f'{kind} worker expects {expected_args} file arguments')
+    try:
+        _run_lightweight_ml_worker(kind, sys.argv[2:])
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise SystemExit(1)
+    raise SystemExit(0)
+
 import numpy as np
 import yfinance as yf
 from dotenv import load_dotenv
@@ -55,8 +153,7 @@ from matplotlib.patches import Polygon
 from PIL import Image, ImageDraw, ImageFont
 from scipy.interpolate import PchipInterpolator
 
-# Global pipeline initialization (loads model once)
-_kokoro_pipeline = None
+# ML models are loaded only in lightweight isolated workers.
 try:
     import httpx  # installed with google-genai; used to recognise network errors
 except ImportError:  # pragma: no cover
@@ -98,22 +195,65 @@ def log_memory(stage: str):
         logger.debug("Memory measurement unavailable: %s", e)
 
 
+def _cgroup_usage_limit() -> Tuple[Optional[int], Optional[int]]:
+    try:
+        cur_file, limit_file = Path('/sys/fs/cgroup/memory.current'), Path('/sys/fs/cgroup/memory.max')
+        cur = int(cur_file.read_text()) if cur_file.exists() else None
+        raw = limit_file.read_text().strip() if limit_file.exists() else 'max'
+        limit = int(raw) if raw.isdecimal() else None
+        return cur, limit
+    except (OSError, ValueError):
+        return None, None
+
+
 def run_memory_worker(kind: str, *args: str) -> None:
-    """Run TTS or Whisper in a *separate OS process* to return its RAM to the OS on exit."""
-    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{kind}-worker", *map(str, args)]
+    """Use a lean ML subprocess and guard the container before Linux's OOM killer strikes."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), f'--{kind}-worker', *map(str, args)]
     env = os.environ.copy()
-    env.setdefault("OMP_NUM_THREADS", "2")
-    env.setdefault("MKL_NUM_THREADS", "2")
-    env.setdefault("OPENBLAS_NUM_THREADS", "2")
-    env["TOKENIZERS_PARALLELISM"] = "false"
-    logger.info("Starting isolated %s worker...", kind)
-    log_memory(f"before {kind}")
-    completed = subprocess.run(cmd, env=env, check=False)
+    # setdefault does NOT override existing large thread-pool settings
+    for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        env[name] = '1'
+    env['TOKENIZERS_PARALLELISM'] = 'false'
+    logger.info('Starting lightweight %s worker...', kind)
+    log_memory(f'before {kind}')
+    before_usage, limit = _cgroup_usage_limit()
+    # Configurable. For a 1 GiB container, reserve at least 96 MiB of headroom.
+    fraction = float(os.getenv('STOCK_MEMORY_GUARD_FRACTION', '0.92'))
+    threshold = min(limit * fraction, limit - 96 * 2**20) if limit else None
+    if threshold is not None and before_usage is not None and before_usage >= threshold:
+        raise MemoryError(f'Container already uses {before_usage / 2**20:.0f} / '
+                          f'{limit / 2**20:.0f} MiB before {kind}; not launching ML worker.')
+    peak = before_usage or 0
+    killed_by_guard = False
+    proc = subprocess.Popen(cmd, env=env)
+    try:
+        while proc.poll() is None:
+            used, _ = _cgroup_usage_limit()
+            if used is not None:
+                peak = max(peak, used)
+            if threshold is not None and used is not None and used > threshold:
+                logger.error('MEMORY GUARD in %s: used %.0f MiB of %.0f MiB; stopping worker',
+                             kind, used / 2**20, limit / 2**20)
+                killed_by_guard = True
+                proc.kill()
+                break
+            time.sleep(0.15)
+        retcode = proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     gc.collect()
-    log_memory(f"after {kind}")
-    if completed.returncode != 0:
-        detail = "The worker was killed by the OS (possible OOM)." if completed.returncode in (-9, 137) else "Check Streamlit Cloud logs."
-        raise RuntimeError(f"{kind} worker exited with status {completed.returncode}. {detail}")
+    log_memory(f'after {kind}; peak container {peak / 2**20:.0f} MiB')
+    if killed_by_guard:
+        raise MemoryError(f'{kind} exceeded memory guard: container reached '
+                          f'{peak / 2**20:.0f} / {limit / 2**20:.0f} MiB. '
+                          'Enable STOCK_APPROX_TIMINGS=1 if this was Whisper; '
+                          'Kokoro requires a larger RAM plan or remote TTS if this was TTS.')
+    if retcode != 0:
+        detail = 'OS killed the worker (likely OOM).' if retcode in (-9, 137) else 'See worker traceback above.'
+        raise RuntimeError(f'{kind} worker exited {retcode}. {detail} '
+                           f'Peak container memory observed: {peak / 2**20:.0f} MiB.')
 
 
 # =====================================================================
@@ -824,16 +964,6 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
 # =====================================================================
 # 7. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
-def get_kokoro_pipeline():
-    """Import the heavy ML dependency only in the TTS worker process."""
-    global _kokoro_pipeline
-    if _kokoro_pipeline is None:
-        from kokoro import KPipeline
-        logger.info("Initializing Kokoro-82M TTS Pipeline in isolated worker...")
-        _kokoro_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
-    return _kokoro_pipeline
-
-
 def clean_script_for_tts(text: str) -> str:
     """Removes non-ASCII characters/emojis & converts symbols for clear TTS."""
     text = re.sub(r"[^\x00-\x7F]+", "", text)
@@ -844,52 +974,11 @@ def clean_script_for_tts(text: str) -> str:
     return text
 
 
-def _generate_voiceovers_in_worker(items: List[Tuple[str, str]]) -> List[float]:
-    """items = [(script_text, output_path), ...]  ->  durations in seconds (same order)."""
-    import soundfile as sf
-    import torch
-    torch.set_num_threads(2)
-    logger.info(f"Generating {len(items)} TTS clips locally with Kokoro-82M (Voice: am_liam)...")
-    pipeline = get_kokoro_pipeline()
-    durations = []
-
-    for text, path in items:
-        clean_text = clean_script_for_tts(text)
-        path_str = str(path)
-        logger.info(f"Generating Kokoro audio: {Path(path_str).name}")
-
-        generator = pipeline(
-            clean_text,
-            voice='am_liam',   # Selected voice
-            speed=1.1,         # Fast speed for shorts
-            split_pattern=r'\n+'
-        )
-
-        all_audio = []
-        for _, _, audio in generator:
-            # Explicit conversion avoids keeping Torch tensors in the concatenation list.
-            if hasattr(audio, "detach"):
-                audio = audio.detach().cpu().numpy()
-            all_audio.append(np.asarray(audio, dtype=np.float32))
-
-        if not all_audio:
-            raise RuntimeError(f"Kokoro failed to generate audio for {path_str}")
-
-        final_audio = np.concatenate(all_audio)
-        sf.write(path_str, final_audio, 24000)  # Kokoro uses 24kHz sample rate
-
-        dur = audio_duration(path_str)
-        durations.append(dur)
-        logger.info(f"✅ Created with Kokoro: {Path(path_str).name} ({dur:.2f}s)")
-
-    return durations
-
-
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
     """Compatibility wrapper: run the actual TTS model in a short-lived process."""
     with tempfile.TemporaryDirectory(prefix="stock_tts_job_") as td:
         job, result = Path(td) / "job.json", Path(td) / "durations.json"
-        job.write_text(json.dumps([(str(txt), str(path)) for txt, path in items]), encoding="utf-8")
+        job.write_text(json.dumps([(clean_script_for_tts(str(txt)), str(path)) for txt, path in items]), encoding="utf-8")
         run_memory_worker("tts", str(job), str(result))
         return json.loads(result.read_text(encoding="utf-8"))
 
@@ -897,38 +986,38 @@ def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
 # =====================================================================
 # 8. WORD TIMINGS (Whisper word timestamps)
 # =====================================================================
-@lru_cache(maxsize=1)
-def get_whisper_model():
-    """Import + load once (the pipeline starts this in the background at second zero)."""
-    import whisper
-    return whisper.load_model("tiny.en")
-
-
-def _transcribe_words_in_worker(audio_file: str) -> List[dict]:
-    """
-    Word-level timings: [{"raw", "text", "start", "end"}].
-    `raw` keeps Whisper's punctuation (used to find sentence ends), `text` is the caption-ready word.
-    """
-    logger.info("🎧 Aligning words with Whisper...")
-    # Whisper accepts a 16 kHz float32 array, so it never needs an ffmpeg executable on PATH.
-    audio = decode_audio(audio_file, sr=16000)
-    result = get_whisper_model().transcribe(audio, word_timestamps=True)
-
-    words = []
-    for seg in result.get("segments", []):
-        for w in seg.get("words", []):
-            raw = w["word"].strip()
-            text = re.sub(r"^[^\w$%]+|[^\w$%]+$", "", raw)   # captions look cleaner without edge punctuation
-            words.append({"raw": raw, "text": text, "start": float(w["start"]), "end": float(w["end"])})
+def approximate_word_timings(script_text: str, duration: float) -> List[dict]:
+    """Memory-free fallback; captions are approximate rather than ASR-aligned."""
+    tokens = clean_script_for_tts(script_text).split()
+    if not tokens:
+        return []
+    weights = [max(1.0, math.sqrt(len(re.sub(r'[^A-Za-z]', '', token)) or 1)) for token in tokens]
+    unit = max(0.01, duration - 0.2) / sum(weights)
+    words, cursor = [], 0.0
+    for token, weight in zip(tokens, weights):
+        end = min(duration, cursor + weight * unit)
+        clean = re.sub(r'^[^\w$%]+|[^\w$%]+$', '', token)
+        words.append({'raw': token, 'text': clean, 'start': cursor, 'end': end})
+        cursor = end
     return words
 
 
-def transcribe_words(audio_file: str) -> List[dict]:
-    """Return word timestamps while keeping Whisper out of the Streamlit process."""
-    with tempfile.TemporaryDirectory(prefix="stock_whisper_job_") as td:
-        result = Path(td) / "words.json"
-        run_memory_worker("whisper", str(audio_file), str(result))
-        return json.loads(result.read_text(encoding="utf-8"))
+def transcribe_words(audio_file: str, script_text: str = '', duration: float = 0.0) -> List[dict]:
+    """Whisper in a lean process; optional low-RAM approximate timings mode."""
+    if os.getenv('STOCK_APPROX_TIMINGS', '0') == '1':
+        logger.warning('Skipping Whisper by STOCK_APPROX_TIMINGS=1; captions are approximate.')
+        return approximate_word_timings(script_text, duration)
+    with tempfile.TemporaryDirectory(prefix='stock_whisper_job_') as td:
+        result = Path(td) / 'words.json'
+        try:
+            run_memory_worker('whisper', str(audio_file), str(result))
+        except (MemoryError, RuntimeError) as exc:
+            is_oom = isinstance(exc, MemoryError) or 'OS killed the worker' in str(exc)
+            if not is_oom or not script_text or not duration:
+                raise
+            logger.warning('Whisper ran out of memory: using approximate caption timings.')
+            return approximate_word_timings(script_text, duration)
+        return json.loads(result.read_text(encoding='utf-8'))
 
 
 def catalyst_window(words: List[dict], n_sentences: int, duration: float) -> Tuple[float, float]:
@@ -1235,15 +1324,18 @@ def build_caption_sprites(words: List[dict], words_per_caption: int = 2,
 
 
 def blend_sprite_over(frame_rgba: np.ndarray, sprite: CaptionSprite) -> None:
-    """Straight-alpha 'over' of a small sprite onto the RGBA chart frame (in place, region only)."""
+    """Composite a caption over only its bounding rectangle, using Pillow's C code."""
     h, w = sprite.rgba.shape[:2]
-    dst = frame_rgba[sprite.y:sprite.y + h, sprite.x:sprite.x + w].astype(np.float32)
-    src = sprite.rgba.astype(np.float32)
-    sa, da = src[:, :, 3:4] / 255.0, dst[:, :, 3:4] / 255.0
-    out_a = sa + da * (1 - sa)
-    out_rgb = (src[:, :, :3] * sa + dst[:, :, :3] * da * (1 - sa)) / np.maximum(out_a, 1e-6)
-    frame_rgba[sprite.y:sprite.y + h, sprite.x:sprite.x + w, :3] = (out_rgb + 0.5).astype(np.uint8)
-    frame_rgba[sprite.y:sprite.y + h, sprite.x:sprite.x + w, 3:4] = (out_a * 255 + 0.5).astype(np.uint8)
+    if h == 0 or w == 0:
+        return
+    region = frame_rgba[sprite.y:sprite.y + h, sprite.x:sprite.x + w]
+    if region.shape != sprite.rgba.shape:
+        raise ValueError('Caption sprite is outside chart bounds')
+    background = Image.fromarray(region.copy(), 'RGBA')
+    foreground = Image.fromarray(sprite.rgba, 'RGBA')
+    blended = Image.alpha_composite(background, foreground)
+    region[...] = np.asarray(blended)
+
 
 
 # =====================================================================
@@ -1338,6 +1430,9 @@ class ChartRenderer:
 # 11. VIDEO RENDER  (python only draws the chart; ffmpeg composites, dims, encodes)
 # =====================================================================
 def pick_background_video() -> Optional[str]:
+    if os.getenv('STOCK_DISABLE_BG_VIDEO', '0') == '1':
+        logger.warning('Background video disabled for low-memory rendering.')
+        return None
     files = sorted(Path(BG_VIDEO_DIR).glob("*.mp4"))
     if not files:
         logger.warning(f"No background videos in {BG_VIDEO_DIR}; using a plain dark background.")
@@ -1462,7 +1557,7 @@ def extract_frame(video_path: str, t: float, out_png: str) -> Optional[str]:
 # =====================================================================
 # 12. PIPELINE + ENTRY POINTS
 # =====================================================================
-def create_stock_short(upload: bool = False, test: bool = False,
+def _create_stock_short_unlocked(upload: bool = False, test: bool = False,
                        on_preview: Optional[Callable[[str], None]] = None) -> str:
     work_dir = Path(tempfile.mkdtemp(prefix="stock_short_"))
     try:
@@ -1486,11 +1581,11 @@ def create_stock_short(upload: bool = False, test: bool = False,
             logger.info(f"🎬 OVERLAY HEADLINE: {script_data.get('overlay_headline')}")
             logger.info("=" * 60)
 
-            audio_file = work_dir / "voiceover.wav"   # Piper writes WAV
+            audio_file = work_dir / "voiceover.wav"   # Kokoro writes WAV
             duration = generate_voiceovers([(script_data["voiceover_text"], audio_file)])[0]
 
             # Whisper is launched only after Kokoro has exited, so their RAM never overlaps.
-            words = transcribe_words(str(audio_file))
+            words = transcribe_words(str(audio_file), script_data["voiceover_text"], duration)
             stock_data["logo_path"] = logo_f.result()                # None -> header is drawn without a logo
             overlay_png = create_overlay_graphics(script_data, stock_data, str(work_dir / "overlay.png"))
             news_card = build_news_card_plan(stock_data, script_data, words, duration,
@@ -1508,6 +1603,9 @@ def create_stock_short(upload: bool = False, test: bool = False,
         output_filename = f"STOCK_{symbol}_{int(stock_data['change_pct'])}pct.mp4"
         render_video(chart, sprites, overlay_png, pick_background_video(), str(audio_file), duration,
                      output_filename, news_card=news_card)
+        chart.fig.clear()
+        del chart, sprites
+        gc.collect()
         log_memory("after video renderer")
         logger.info(f"✅ SUCCESS! Video saved as: {output_filename}")
 
@@ -1532,6 +1630,25 @@ def create_stock_short(upload: bool = False, test: bool = False,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+
+def create_stock_short(upload: bool = False, test: bool = False,
+                       on_preview: Optional[Callable[[str], None]] = None) -> str:
+    """Allow one pipeline at a time across Streamlit sessions in this container."""
+    if sys.platform == 'linux':
+        import fcntl
+        lock_path = Path(tempfile.gettempdir()) / 'stock_short_pipeline.lock'
+        with lock_path.open('w') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError('Another video is being generated. Try again after it finishes.') from exc
+            try:
+                return _create_stock_short_unlocked(upload=upload, test=test, on_preview=on_preview)
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+    return _create_stock_short_unlocked(upload=upload, test=test, on_preview=on_preview)
+
+
 def render_final_video() -> str:
     """Render and upload to YouTube."""
     return create_stock_short(upload=True)
@@ -1546,17 +1663,4 @@ def view_final_video() -> str:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "--tts-worker":
-        if len(sys.argv) != 4:
-            raise SystemExit("Usage: --tts-worker input.json output.json")
-        payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-        result = _generate_voiceovers_in_worker(payload)
-        Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
-    elif len(sys.argv) >= 2 and sys.argv[1] == "--whisper-worker":
-        if len(sys.argv) != 4:
-            raise SystemExit("Usage: --whisper-worker input.wav output.json")
-        result = _transcribe_words_in_worker(sys.argv[2])
-        Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
-    else:
-        create_stock_short(upload=False)
-
+    create_stock_short(upload=False)
