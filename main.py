@@ -204,7 +204,7 @@ def _cgroup_memory_snapshot() -> dict:
         # and shared-memory pages. This is a heuristic, not a RAM guarantee.
         remaining_clean = max(0, clean_file_cache - inactive)
         active = min(stats.get('active_file', 0), remaining_clean)
-        active_credit = min(0.40, max(0.0, float(os.getenv('STOCK_ACTIVE_CACHE_CREDIT', '0.25'))))
+        active_credit = min(0.40, max(0.0, float(os.getenv('STOCK_ACTIVE_CACHE_CREDIT', '0.4'))))
         result['reclaimable'] = inactive + active
         result['cache_credit'] = int(inactive * 0.85 + active * active_credit)
         result['guarded'] = max(0, result['raw'] - result['cache_credit'])
@@ -260,7 +260,7 @@ def run_memory_worker(kind: str, *args: str) -> None:
     log_memory(f'before {kind}')
     before = _cgroup_memory_snapshot()
     limit = before['limit']
-    fraction = min(0.98, max(0.50, float(os.getenv('STOCK_MEMORY_GUARD_FRACTION', '0.92'))))
+    fraction = min(0.98, max(0.50, float(os.getenv('STOCK_MEMORY_GUARD_FRACTION', '0.96'))))
     threshold = min(limit * fraction, limit - 96 * 2**20) if limit else None
     current_guarded = before['guarded']
     if threshold is not None and current_guarded is not None and current_guarded >= threshold:
@@ -285,7 +285,7 @@ def run_memory_worker(kind: str, *args: str) -> None:
                 raw_peak = max(raw_peak, stats['raw'])
             if stats['guarded'] is not None:
                 guarded_peak = max(guarded_peak, stats['guarded'])
-            if False and (threshold is not None and stats['guarded'] is not None
+            if (threshold is not None and stats['guarded'] is not None
 
                     and stats['guarded'] > threshold):
                 logger.error('MEMORY GUARD in %s: guarded=%.0f MiB / limit %.0f MiB '
