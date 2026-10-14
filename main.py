@@ -1,8 +1,9 @@
-# Patched for low-memory Streamlit deployments. v2 fixes cgroup page-cache accounting.
+# Patched for low-memory Streamlit deployments. v3 defers chart libraries and optional Whisper.
 # Optional environment settings:
-#   STOCK_APPROX_TIMINGS=1     skips Whisper (estimated subtitle timings)
+#   STOCK_APPROX_TIMINGS=1     skips Whisper (default: estimated subtitle timings)
 #   STOCK_DISABLE_BG_VIDEO=1   eliminates background-video decode cost
 #   STOCK_MEMORY_GUARD_FRACTION=0.92  terminates ML worker before cgroup OOM
+#   STOCK_ACTIVE_CACHE_CREDIT=0.25  conservatively account for reclaimable active page cache
 
 """
 Top-moving-stock vertical short (1080x1920)  -  refactored for speed
@@ -147,11 +148,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
-from matplotlib.patches import Polygon
 from PIL import Image, ImageDraw, ImageFont
-from scipy.interpolate import PchipInterpolator
 
 # ML models are loaded only in lightweight isolated workers.
 try:
@@ -176,7 +173,7 @@ def _cgroup_memory_snapshot() -> dict:
     path = Path('/sys/fs/cgroup')
     result = {'raw': None, 'limit': None, 'reclaimable': 0,
               'guarded': None, 'anon': 0, 'file': 0, 'shmem': 0,
-              'inactive_file': 0, 'oom_kill': None}
+              'inactive_file': 0, 'active_file': 0, 'cache_credit': 0, 'oom_kill': None}
     try:
         raw_path, limit_path = path / 'memory.current', path / 'memory.max'
         if not raw_path.exists():
@@ -194,15 +191,23 @@ def _cgroup_memory_snapshot() -> dict:
                         stats[parts[0]] = int(parts[1])
                     except ValueError:
                         continue
-        for name in ('anon', 'file', 'shmem', 'inactive_file'):
+        for name in ('anon', 'file', 'shmem', 'inactive_file', 'active_file'):
             result[name] = stats.get(name, 0)
         # 'file' also accounts for tmpfs/shmem, which should not be deducted.
         # Dirty/writeback pages are not immediately reclaimable either.
         clean_file_cache = max(0, stats.get('file', 0) - stats.get('shmem', 0)
                                - stats.get('file_dirty', 0) - stats.get('file_writeback', 0))
-        result['reclaimable'] = min(stats.get('inactive_file', 0), clean_file_cache)
-        # Conservative margin: credit only 85% of the estimated inactive file cache.
-        result['guarded'] = max(0, result['raw'] - int(result['reclaimable'] * 0.85))
+        inactive = min(stats.get('inactive_file', 0), clean_file_cache)
+        # Active file-backed pages are not automatically "unreclaimable": the kernel
+        # can reclaim CLEAN active page cache too if the cgroup runs short of RAM.
+        # Credit only a conservative fraction (configurable), after excluding dirty
+        # and shared-memory pages. This is a heuristic, not a RAM guarantee.
+        remaining_clean = max(0, clean_file_cache - inactive)
+        active = min(stats.get('active_file', 0), remaining_clean)
+        active_credit = min(0.40, max(0.0, float(os.getenv('STOCK_ACTIVE_CACHE_CREDIT', '0.25'))))
+        result['reclaimable'] = inactive + active
+        result['cache_credit'] = int(inactive * 0.85 + active * active_credit)
+        result['guarded'] = max(0, result['raw'] - result['cache_credit'])
         events_path = path / 'memory.events'
         if events_path.exists():
             for line in events_path.read_text().splitlines():
@@ -228,11 +233,11 @@ def log_memory(stage: str):
         logger.info(
             'MEMORY [%s]: main RSS=%s MiB, cgroup=%s/%s MiB, '
             'anon=%s MiB, file=%s MiB, shmem=%s MiB, '
-            'inactive_file=%s MiB, estimated_reclaimable=%s MiB, '
+            'inactive_file=%s MiB, active_file=%s MiB, clean_cache=%s MiB, cache_credit=%s MiB, '
             'guarded_usage=%s MiB, cgroup_oom_kill=%s',
             stage, f'{rss_kb / 1024:.0f}' if rss_kb is not None else 'N/A',
             mb(m['raw']), mb(m['limit']), mb(m['anon']), mb(m['file']),
-            mb(m['shmem']), mb(m['inactive_file']), mb(m['reclaimable']),
+            mb(m['shmem']), mb(m['inactive_file']), mb(m['active_file']), mb(m['reclaimable']), mb(m['cache_credit']),
             mb(m['guarded']), m['oom_kill'] if m['oom_kill'] is not None else 'N/A',
         )
     except Exception as e:
@@ -262,10 +267,10 @@ def run_memory_worker(kind: str, *args: str) -> None:
         raise MemoryError(
             f'Not enough non-reclaimable RAM before {kind}: '
             f'cgroup raw={before["raw"] / 2**20:.0f} / {limit / 2**20:.0f} MiB, '
-            f'file cache estimate={before["reclaimable"] / 2**20:.0f} MiB, '
+            f'cache credit estimate={before["cache_credit"] / 2**20:.0f} MiB, '
             f'guarded usage={current_guarded / 2**20:.0f} MiB '
             f'(threshold={threshold / 2**20:.0f} MiB). '
-            'This is actual memory pressure, not merely raw page cache. '
+            'Memory pressure estimate is conservative, but not exact. '
             'See the MEMORY log for main RSS/anon/shmem and restart the app '
             'if there are stuck processes.')
 
@@ -283,9 +288,9 @@ def run_memory_worker(kind: str, *args: str) -> None:
             if (threshold is not None and stats['guarded'] is not None
                     and stats['guarded'] > threshold):
                 logger.error('MEMORY GUARD in %s: guarded=%.0f MiB / limit %.0f MiB '
-                             '(raw=%.0f, reclaimable cache=%.0f); stopping worker',
+                             '(raw=%.0f, credited cache=%.0f); stopping worker',
                              kind, stats['guarded']/2**20, limit/2**20,
-                             (stats['raw'] or 0)/2**20, stats['reclaimable']/2**20)
+                             (stats['raw'] or 0)/2**20, stats['cache_credit']/2**20)
                 killed_by_guard = True
                 proc.kill()
                 break
@@ -1398,6 +1403,11 @@ def blend_sprite_over(frame_rgba: np.ndarray, sprite: CaptionSprite) -> None:
 # =====================================================================
 class ChartRenderer:
     def __init__(self, stock_data: dict, duration: float, market_metrics: Optional[dict] = None):
+        # These are heavy libraries; no reason to load them before TTS/Whisper.
+        from scipy.interpolate import PchipInterpolator
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from matplotlib.patches import Polygon
         self.duration = duration
         prices = np.asarray(stock_data["history"].values, dtype=float)
         if len(prices) < 2:
@@ -1624,8 +1634,7 @@ def _create_stock_short_unlocked(upload: bool = False, test: bool = False,
             symbol = stock_data["symbol"]
             news_f = pool.submit(fetch_news_context, symbol)
             name_f = pool.submit(get_company_name, symbol)
-            logo_f = pool.submit(get_ticker_logo, symbol)            # downloads/validates while the LLM works
-            metrics_f = pool.submit(fetch_market_metrics, symbol)   # runs while the LLM + TTS work below
+            # Keep the container quiet during the memory-heavy Kokoro model load.
             stock_data["news"], stock_data["news_items"] = news_f.result()
             stock_data["company_name"] = name_f.result()
 
@@ -1641,11 +1650,11 @@ def _create_stock_short_unlocked(upload: bool = False, test: bool = False,
 
             # Whisper is launched only after Kokoro has exited, so their RAM never overlaps.
             words = transcribe_words(str(audio_file), script_data["voiceover_text"], duration)
-            stock_data["logo_path"] = logo_f.result()                # None -> header is drawn without a logo
+            stock_data["logo_path"] = get_ticker_logo(symbol)
             overlay_png = create_overlay_graphics(script_data, stock_data, str(work_dir / "overlay.png"))
             news_card = build_news_card_plan(stock_data, script_data, words, duration,
                                              str(work_dir / "news_card.png"))
-            market_metrics = metrics_f.result()
+            market_metrics = fetch_market_metrics(symbol)
         logger.info(f"Market metrics: {market_metrics}")
 
         # ---- Phase B: render ----
