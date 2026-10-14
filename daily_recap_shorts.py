@@ -107,19 +107,6 @@ C_GREEN, C_RED, C_CYAN, C_GOLD, C_AMBER = "#00FFA3", "#FF3366", "#00E5FF", "#FFD
 AVATAR_OPEN_PATH = "assets/avatar/open.png"
 AVATAR_CLOSED_PATH = "assets/avatar/closed.png"
 
-
-# --- Layout (pixels, authored for 1080x1920 and scaled by UI_SCALE) ---
-#
-#   0   ┌──────────────────────────────┐
-#       │ (Shorts top UI - kept clear) │
-#  100  │ NEWS TICKER                  │
-#  190  │ title / price header         │
-#  335  │ CHART (indexes or candles)   │
-#  940  │                              │
-# 1000  │ subtitles                    │
-# 1190  │ [ AVATAR ]  [ TOP MOVERS ]   │
-# 1670  │ (Shorts bottom UI - kept clear)
-# 1920  └──────────────────────────────┘
 def px(v: float) -> int:
     return int(round(v * UI_SCALE))
 
@@ -163,7 +150,7 @@ class StockAnalysis(BaseModel):
 
 
 class FullVideoScriptSchema(BaseModel):
-    intro_script: str = Field(description="STRICTLY 20 to 30 words English intro script with high CTA.")
+    intro_script: str = Field(description="STRICTLY 20 to 30 words English intro script Designed to Hok Viewers")
     news_ticker_text: str = Field(description="Single line ticker with top 3-5 market headlines + short 4-word summary each, separated by '  •  ' e.g. 'FED CUTS RATES: Policy shifted dovish  •  NVDA SURGES: AI chip demand peaks  •  BTC BREAKS $70K: Institutional inflow high'")
     analyzed_stocks: List[StockAnalysis]
     youtube_title: str
@@ -413,7 +400,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     RULES:
     1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK, 20 to 30 words, with a call to action.
     2. "news_ticker_text": Generate 3 high-impact breaking news headlines with ultra-short descriptions, separated by ' • '. Keep text uppercase and ultra punchy for top scrolling ticker.
-    3. "analyzed_stocks": Max 4 key stocks. Fill key_levels with precise chart levels (they are only drawn on the chart).
+    3. "analyzed_stocks": Max 6 key stocks. Fill key_levels with precise chart levels (they are only drawn on the chart), on the last stock make a CTA in the end of the script
     4. For every stock, "script" is ONE or TWO short sentences (max 25 words total) explaining ONLY the reason
        behind the stock's move today, for example why it dropped, using the headlines above.
        Do NOT mention prices, price levels, percentages or any numbers in it.
