@@ -65,102 +65,145 @@ if "WEBHOOK_TOKEN" in query_params:
 # פונקציה לייצור ושילוב ה- Live Counter
 # =========================================================
 def render_live_counter():
-    # חישוב זמני ארה"ב (מזרח) לפי הלו"ז שהגדרת
     tz = ZoneInfo("America/New_York")
     now = datetime.now(tz)
-    events = []
 
-    # בודקים את היום והמחר כדי למצוא את 3 האירועים הקרובים הבאים
-    for day_offset in range(2):
-        target_date = now + timedelta(days=day_offset)
-        is_weekday = target_date.weekday() < 5 # שני עד שישי (0-4)
+    # פונקציית עזר למציאת המועד הקרוב הבא של אירוע
+    def get_next_occurrence(hour, minute, weekdays_only=False):
+        for day_offset in range(8):
+            dt = (now + timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if dt > now:
+                if weekdays_only and dt.weekday() >= 5:  # 5=שבת, 6=ראשון
+                    continue
+                return dt
+        return now
 
-        # 1. בוקר לפני מסחר (08:14 EST)
-        t1 = target_date.replace(hour=8, minute=14, second=0, microsecond=0)
-        if t1 > now:
-            events.append({"name": "עדכון בוקר (Update / VS)", "timestamp": t1.timestamp()})
+    # הגדרת 5 האירועים לחישוב
+    targets = [
+        {
+            "id": "morning_video",
+            "title": "🌅 עדכון בוקר",
+            "type": "סרטון",
+            "ts": get_next_occurrence(8, 14, weekdays_only=False).timestamp()
+        },
+        {
+            "id": "viral_video",
+            "title": "🔥 שעה ויראלית",
+            "type": "סרטון",
+            "ts": get_next_occurrence(13, 25, weekdays_only=False).timestamp()
+        },
+        {
+            "id": "daily_summary",
+            "title": "📊 סיכום יומי",
+            "type": "סרטון",
+            "ts": get_next_occurrence(18, 21, weekdays_only=True).timestamp()
+        },
+        {
+            "id": "market_open",
+            "title": "🔔 פתיחת מסחר",
+            "type": "בורסה",
+            "ts": get_next_occurrence(9, 30, weekdays_only=True).timestamp()
+        },
+        {
+            "id": "market_close",
+            "title": "🔕 סגירת מסחר",
+            "type": "בורסה",
+            "ts": get_next_occurrence(16, 0, weekdays_only=True).timestamp()
+        }
+    ]
 
-        # 2. שעה ויראלית (13:25 EST)
-        t2 = target_date.replace(hour=13, minute=25, second=0, microsecond=0)
-        if t2 > now:
-            events.append({"name": "שעה ויראלית (VS Video)", "timestamp": t2.timestamp()})
+    events_json = json.dumps(targets)
 
-        # 3. סיכום יום מסחר (18:21 EST) - רץ רק בימי מסחר!
-        if is_weekday:
-            t3 = target_date.replace(hour=18, minute=21, second=0, microsecond=0)
-            if t3 > now:
-                events.append({"name": "סיכום יומי (Daily Summary)", "timestamp": t3.timestamp()})
-
-    # מיון מהקרוב לרחוק ולקיחת 3 הבאים בלבד
-    events.sort(key=lambda x: x["timestamp"])
-    upcoming_events = events[:3]
-    events_json = json.dumps(upcoming_events)
-
-    # HTML ו-JS של טיימר חי (מעוצב יפה)
     html_code = f"""
-    <div dir="rtl" style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #ffffff; padding: 20px; border-radius: 12px; border: 1px solid #444; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-        <div style="text-align: center;">
-            <h3 style="margin-top: 0; color: #a5d6a7; font-size: 1.2rem;">⏱️ הסרטון הבא מתחיל בעוד:</h3>
-            <div id="countdown" style="font-size: 3rem; font-weight: bold; color: #ff4b4b; text-shadow: 0 0 10px rgba(255,75,75,0.3); margin: 10px 0;">--:--:--</div>
-            <div style="font-size: 1.1rem; color: #e0e0e0;">משימה הבאה: <strong id="next-event-name" style="color: #64b5f6;">--</strong></div>
+    <div dir="rtl" style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #18191a; padding: 15px; border-radius: 12px; border: 1px solid #333; color: #fff;">
+
+        <div style="margin-bottom: 12px; font-weight: bold; font-size: 1.05rem; color: #64b5f6; display: flex; align-items: center; gap: 8px;">
+            🎬 סרטונים מתוזמנים
         </div>
-        <hr style="border: 0; border-top: 1px solid #444; margin: 20px 0;">
-        <div style="display: flex; justify-content: space-between; font-size: 0.95rem;">
-            <div style="flex: 1;">
-                <strong style="color: #ffb74d;">📅 אירועים קרובים:</strong>
-                <ul id="upcoming-list" style="margin: 5px 0; padding-right: 20px; color: #bbb;"></ul>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px;">
+            <!-- כרטיסיות סרטונים -->
+            <div id="card-morning_video" style="background: #242526; padding: 12px; border-radius: 8px; border-top: 3px solid #ffb74d; text-align: center;">
+                <div style="font-size: 0.9rem; font-weight: bold; color: #ffb74d;">🌅 עדכון בוקר</div>
+                <div id="time-morning_video" style="font-size: 0.75rem; color: #aaa; margin: 3px 0;">--:--</div>
+                <div id="timer-morning_video" style="font-size: 1.25rem; font-weight: bold; color: #fff; font-family: monospace;">--:--:--</div>
             </div>
-            <div style="flex: 1; text-align: left;" dir="ltr">
-                <strong style="color: #ffb74d; display: block; text-align: right;" dir="rtl">📈 שעות שוק (ארה"ב):</strong>
-                <div style="margin-top: 5px; color: #bbb; text-align: right;" dir="rtl">
-                    🟢 פתיחת מסחר: 09:30<br>
-                    🔴 סגירת מסחר: 16:00
-                </div>
+
+            <div id="card-viral_video" style="background: #242526; padding: 12px; border-radius: 8px; border-top: 3px solid #ff7043; text-align: center;">
+                <div style="font-size: 0.9rem; font-weight: bold; color: #ff7043;">🔥 שעה ויראלית</div>
+                <div id="time-viral_video" style="font-size: 0.75rem; color: #aaa; margin: 3px 0;">--:--</div>
+                <div id="timer-viral_video" style="font-size: 1.25rem; font-weight: bold; color: #fff; font-family: monospace;">--:--:--</div>
+            </div>
+
+            <div id="card-daily_summary" style="background: #242526; padding: 12px; border-radius: 8px; border-top: 3px solid #ab47bc; text-align: center;">
+                <div style="font-size: 0.9rem; font-weight: bold; color: #ab47bc;">📊 סיכום יומי</div>
+                <div id="time-daily_summary" style="font-size: 0.75rem; color: #aaa; margin: 3px 0;">--:--</div>
+                <div id="timer-daily_summary" style="font-size: 1.25rem; font-weight: bold; color: #fff; font-family: monospace;">--:--:--</div>
             </div>
         </div>
+
+        <div style="margin-bottom: 12px; font-weight: bold; font-size: 1.05rem; color: #81c784; display: flex; align-items: center; gap: 8px;">
+            📈 שעות שוק (Wall Street)
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+            <!-- כרטיסיות בורסה -->
+            <div id="card-market_open" style="background: #242526; padding: 12px; border-radius: 8px; border-top: 3px solid #66bb6a; text-align: center;">
+                <div style="font-size: 0.9rem; font-weight: bold; color: #66bb6a;">🔔 פתיחת מסחר</div>
+                <div id="time-market_open" style="font-size: 0.75rem; color: #aaa; margin: 3px 0;">--:--</div>
+                <div id="timer-market_open" style="font-size: 1.25rem; font-weight: bold; color: #fff; font-family: monospace;">--:--:--</div>
+            </div>
+
+            <div id="card-market_close" style="background: #242526; padding: 12px; border-radius: 8px; border-top: 3px solid #ef5350; text-align: center;">
+                <div style="font-size: 0.9rem; font-weight: bold; color: #ef5350;">🔕 סגירת מסחר</div>
+                <div id="time-market_close" style="font-size: 0.75rem; color: #aaa; margin: 3px 0;">--:--</div>
+                <div id="timer-market_close" style="font-size: 1.25rem; font-weight: bold; color: #fff; font-family: monospace;">--:--:--</div>
+            </div>
+        </div>
+
     </div>
+
     <script>
         const events = {events_json};
-        if(events.length > 0) {{
-            const nextEvent = events[0];
-            document.getElementById('next-event-name').innerText = nextEvent.name;
 
-            function updateTimer() {{
-                const now = new Date().getTime();
-                const target = nextEvent.timestamp * 1000;
+        // אתחול תצוגת השעות המקומיות
+        events.forEach(item => {{
+            const t = new Date(item.ts * 1000);
+            const timeStr = t.toLocaleTimeString('he-IL', {{hour: '2-digit', minute:'2-digit'}});
+            const dayStr = t.toLocaleDateString('he-IL', {{weekday: 'short'}});
+            document.getElementById('time-' + item.id).innerText = dayStr + " " + timeStr;
+        }});
+
+        function updateTimers() {{
+            const now = new Date().getTime();
+
+            events.forEach(item => {{
+                const target = item.ts * 1000;
                 const diff = target - now;
 
+                const timerEl = document.getElementById('timer-' + item.id);
+
                 if (diff <= 0) {{
-                    document.getElementById('countdown').innerText = "מופעל עכשיו! 🚀";
+                    timerEl.innerText = "בפעולה! 🚀";
+                    timerEl.style.color = "#ff4b4b";
                     return;
                 }}
 
-                const h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                const h = Math.floor(diff / (1000 * 60 * 60));
                 const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
                 const s = Math.floor((diff % (1000 * 60)) / 1000);
 
-                document.getElementById('countdown').innerText =
-                    (h < 10 ? "0" + h : h) + ":" +
-                    (m < 10 ? "0" + m : m) + ":" +
-                    (s < 10 ? "0" + s : s);
-            }}
+                const hStr = h < 10 ? "0" + h : h;
+                const mStr = m < 10 ? "0" + m : m;
+                const sStr = s < 10 ? "0" + s : s;
 
-            const listEl = document.getElementById('upcoming-list');
-            events.forEach(e => {{
-                // המרת הזמן לשעה המקומית של הדפדפן של המשתמש! 
-                const t = new Date(e.timestamp * 1000);
-                const timeString = t.toLocaleTimeString('he-IL', {{hour: '2-digit', minute:'2-digit'}});
-                const li = document.createElement('li');
-                li.innerText = e.name + " - " + timeString;
-                listEl.appendChild(li);
+                timerEl.innerText = hStr + ":" + mStr + ":" + sStr;
             }});
-
-            setInterval(updateTimer, 1000);
-            updateTimer();
         }}
+
+        setInterval(updateTimers, 1000);
+        updateTimers();
     </script>
     """
-    components.html(html_code, height=300)
+    components.html(html_code, height=330)
 
 # =========================================================
 # ממשק המשתמש הרגיל של האפליקציה

@@ -13,7 +13,7 @@ image = (
 # מופעל מדויק כל 10 דקות
 @app.function(
     image=image,
-    schedule=modal.Period(minutes=10),
+    schedule=modal.Period(minutes=30),
     timeout=60
 )
 def ping_streamlit():

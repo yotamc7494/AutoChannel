@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import tempfile
@@ -422,7 +423,9 @@ def render_chart_video_to_disk(
         ax.set_facecolor("none")
         ax.grid(True, color=palette["grid"], linestyle="--", linewidth=1, alpha=0.5)
 
-        progress = min(t / duration, 1.0)
+        h_p = 1 - math.pow(1 - min(t / duration, 1.0), 3)
+        s_p = 1 - math.pow(1 - min(t / duration, 1.0), 2)
+        progress = 0.8*s_p + 0.2*h_p
         idx = max(1, int(progress * (n_dense - 1)))
         idx_orig = min(max(0, int(progress * (n_original - 1))), n_original - 1)
 
@@ -527,7 +530,7 @@ def mix_audio_and_video(silent_video_path, music_path, output_path, total_durati
 
 def create_comparison_fomo_video(ticker1, ticker2, sector_name, music_path, investment,
                                  output_filename="fomo_comparison.mp4"):
-    duration = random.randint(25, 35)
+    duration = random.randint(15, 20)
     fps = 15
     width, height = 1080, 1920
 
