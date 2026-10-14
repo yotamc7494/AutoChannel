@@ -27,6 +27,7 @@ from moviepy import (
     TextClip,
     CompositeVideoClip,
     concatenate_videoclips,
+    ImageClip
 )
 import urllib.request
 import moviepy.audio.fx as afx
@@ -54,14 +55,14 @@ GEMINI_MODEL2 = "gemini-flash-lite-latest"
 class StockAnalysis(BaseModel):
     ticker: str = Field(description="Stock ticker symbol, e.g. NVDA")
     company_spoken_name: str = Field(description="Full spoken company name for TTS, e.g. Nvidia")
-    script: str = Field(description="Spoken narrative for TTS (~40 words).Starting with technical data and mostly predictions, level targets and some CTA.")
+    script: str = Field(description="Spoken narrative for TTS (~40 words).Starting with technical data and mostly predictions and level targets")
     timeframe: str = Field(description="Chart timeframe: '1d', '1mo', '3mo', '6mo', or '1y'")
     interval: str = Field(description="Chart interval: '5m' for 1d, '1d' for others")
     key_levels: List[float] = Field(default=[], description="Important price levels to highlight on chart")
     highlight_type: str = Field(default="none", description="Type of overlay: 'breakout', 'support', 'resistance', or 'none'")
 
 class FullVideoScriptSchema(BaseModel):
-    intro_script: str = Field(description="STRICTLY 15 to 25 words English intro script with high CTA.")
+    intro_script: str = Field(description="STRICTLY 25 to 40 words English intro script with high CTA.")
     news_ticker_text: str = Field(description="Single line ticker with top 3-5 market headlines + short 4-word summary each, separated by '  •  ' e.g. 'FED CUTS RATES: Policy shifted dovish  •  NVDA SURGES: AI chip demand peaks  •  BTC BREAKS $70K: Institutional inflow high'")
     analyzed_stocks: List[StockAnalysis]
     youtube_title: str
@@ -363,7 +364,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     {json.dumps(verified_market_data, indent=2)}
 
     RULES:
-    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK (15 TO 25 WORDS).
+    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK.
     2. "news_ticker_text": Generate 3 high-impact breaking news headlines with ultra-short descriptions, separated by ' • '. Keep text uppercase and ultra punchy for top scrolling ticker.
     3. "analyzed_stocks": Max 4 key stocks with precise key levels.
     4. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field.
@@ -446,7 +447,7 @@ def run_perfect_pipeline(
         final_description = (script_schema.description + chapters_text).strip()
 
         # === חלק 7: איחוד והפקת סרטון סופי ===
-        final_video = concatenate_videoclips([intro_clip] + stock_clips + [outro_clip])
+        final_video = concatenate_videoclips([intro_clip])# + stock_clips + [outro_clip])
 
         if bg_music_path and os.path.exists(bg_music_path):
             logger.info("🎵 Mixing background music...")
@@ -469,7 +470,7 @@ def run_perfect_pipeline(
             audio_codec="aac",
             bitrate="8000k",
             threads=8,
-            logger=None,
+            #logger=None,
             preset="ultrafast"
         )
 
@@ -550,11 +551,43 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
 
     seg_dur = duration / 3.0
 
-    sidebar_w, sidebar_h = int(1920 * 0.18), int(1080 * 0.68)
+    # 🎛️ פרמטר רגישות לדיבור (שנה אותו כדי לשחק עם תגובתיות הפה והקפיצה)
+    # ככל שהמספר נמוך יותר -> הדמות תדבר יותר בקלות. (טווח מומלץ: 0.02 עד 0.15)
+    SPEAKING_THRESHOLD = 0.08
+
+    # === 1. חישוב מיקומים מתמטיים מדויקים ביחס לגרף ===
+    # הגרף שלנו ממוקם ב-Y בין 0.10 (למטה) ל-0.78 (למעלה) באחוזים של Matplotlib
+    graph_y_top = int(1080 * (1 - 0.78))  # יוצא 237 פיקסלים מלמעלה
+    graph_y_bottom = int(1080 * (1 - 0.10))  # יוצא 972 פיקסלים מלמעלה
+
+    sidebar_w = int(1920 * 0.18)  # רוחב הפאנל (כ-345 פיקסלים)
+    x1, x2 = int(1920 * 0.77), int(1920 * 0.77) + sidebar_w
+
+    # מסגרת האוואטר (1:1) - הלמטה שלה בול על הלמטה של הגרף
+    y2_av = graph_y_bottom
+    y1_av = y2_av - sidebar_w  # הגובה זהה לרוחב ליצירת ריבוע מדויק
+
+    # הסיידבר (רשימת מניות) - הלמעלה שלו בול על הלמעלה של הגרף, יורד עד לאוואטר (מינוס 10 פיקסלים רווח)
+    y1_side = graph_y_top
+    y2_side = y1_av - 10
+    sidebar_h = y2_side - y1_side
+
+    # יצירת סיידבר בגובה המדויק שחושב
     sidebar_img = render_static_sidebar_image(watchlist, width_px=sidebar_w, height_px=sidebar_h)
 
-    x1, x2 = int(1920 * 0.77), int(1920 * 0.77) + sidebar_w
-    y1, y2 = int(1080 * 0.22), int(1080 * 0.22) + sidebar_h
+    # === 2. טעינת נתוני האוואטר והסאונד ===
+    from PIL import Image
+    try:
+        av_open_pil = Image.open("assets/avatar/open.png").convert("RGBA").resize((sidebar_w, sidebar_w))
+        av_closed_pil = Image.open("assets/avatar/closed.png").convert("RGBA").resize((sidebar_w, sidebar_w))
+        av_open = np.array(av_open_pil)
+        av_closed = np.array(av_closed_pil)
+    except Exception as e:
+        logger.warning(f"Avatar images missing: {e}")
+        av_open = np.zeros((sidebar_w, sidebar_w, 4), dtype=np.uint8)
+        av_closed = np.zeros((sidebar_w, sidebar_w, 4), dtype=np.uint8)
+
+    audio_peaks = get_audio_peaks(audio_path, fps=30)
 
     fig = plt.figure(figsize=(19.2, 10.8), dpi=100)
     canvas = FigureCanvasAgg(fig)
@@ -569,10 +602,10 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
         fig.clf()
         fig.patch.set_facecolor('#0B0E14')
 
-        # 📰 1. ציור פס החדשות לפי global_t
+        # ציור פס החדשות
         draw_news_ticker_bar(fig, raw_ticker, global_t)
 
-        # 📈 2. אזור הגרף הראשי
+        # אזור הגרף הראשי (צר יותר כדי לא לדרוס את האוואטר)
         ax = fig.add_axes([0.05, 0.10, 0.70, 0.68])
         ax.set_facecolor('#0B0E14')
 
@@ -617,8 +650,34 @@ def render_dynamic_intro_clip(market_data: dict, audio_path: str, duration: floa
         canvas.draw()
         frame_img = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
 
-        # הדבקת הסיידבר
-        frame_img[y1:y2, x1:x2] = sidebar_img
+        # 1. הדבקת הסיידבר
+        frame_img[y1_side:y2_side, x1:x2] = sidebar_img
+
+        # === 2. יצירה והדבקה של קוביית האוואטר המגיבה לסאונד ===
+        frame_idx = min(int(t * 30), len(audio_peaks) - 1)
+        vol = audio_peaks[frame_idx]
+
+        # שימוש בפרמטר הסף שהגדרנו למעלה
+        is_speaking = vol > SPEAKING_THRESHOLD
+
+        base_av = av_open if is_speaking else av_closed
+        # הבטחת קפיצה מורגשת לעין של לפחות 8 פיקסלים בזמן דיבור
+        bob_px = int(min(max(vol * 50, 4), 20)) if is_speaking else 0
+
+        box_bg = np.full((sidebar_w, sidebar_w, 3), [22, 27, 34], dtype=np.uint8)
+        box_bg[:4, :] = box_bg[-4:, :] = box_bg[:, :4] = box_bg[:, -4:] = [48, 54, 61]
+
+        alpha = base_av[:, :, 3] / 255.0
+        for c in range(3):
+            if bob_px > 0:
+                char_slice = base_av[bob_px:, :, c]
+                alpha_slice = alpha[bob_px:, :]
+                box_bg[:-bob_px, :, c] = (alpha_slice * char_slice + (1 - alpha_slice) * box_bg[:-bob_px, :, c]).astype(
+                    np.uint8)
+            else:
+                box_bg[:, :, c] = (alpha * base_av[:, :, c] + (1 - alpha) * box_bg[:, :, c]).astype(np.uint8)
+
+        frame_img[y1_av:y2_av, x1:x2] = box_bg
 
         return frame_img
 
@@ -669,6 +728,94 @@ def render_static_sidebar_image(watchlist: List[dict], width_px: int = 345, heig
     plt.close(fig)
     return sidebar_img
 
+
+# ---------------------------------------------------------
+# Audio-Reactive Avatar Engine
+# ---------------------------------------------------------
+def render_audio_reactive_avatar(audio_path: str, duration: float, fps: int = 30) -> VideoClip:
+    """קוראת את קובץ השמע, מחשבת ווליום, ומנפישה את הדמות (פה פתוח/סגור + קפיצה) בסנכרון מלא."""
+    # 1. טעינת התמונות (הרקע השקוף כבר קיים בקבצים)
+    closed_clip = ImageClip("assets/avatar/closed.png").resized(height=380)
+    open_clip = ImageClip("assets/avatar/open.png").resized(height=380)
+
+    # 2. המרת האודיו למערך נומרי לניתוח עוצמת קול
+    audio_clip = AudioFileClip(audio_path)
+    audio_array = audio_clip.to_soundarray(fps=fps)
+
+    # המרה למונו אם האודיו הוא סטריאו (מערך דו-ממדי)
+    if audio_array.ndim == 2:
+        audio_array = audio_array.mean(axis=1)
+
+    # חישוב עוצמת השמע (RMS) לכל חלקיק פריים
+    chunk_size = int(audio_clip.fps / fps)
+    volumes = []
+    for i in range(0, len(audio_array), chunk_size):
+        chunk = audio_array[i:i + chunk_size]
+        vol = np.sqrt(np.mean(chunk ** 2)) if len(chunk) > 0 else 0
+        volumes.append(vol)
+
+    volumes = np.array(volumes)
+    max_vol = np.max(volumes) if np.max(volumes) > 0 else 1
+    volumes = volumes / max_vol  # נרמול עוצמת הקול לטווח 0.0 - 1.0
+
+    # 3. בניית הפריים והשקיפות (Mask) לפי הווליום
+    def make_frame(t):
+        idx = min(int(t * fps), len(volumes) - 1)
+        # סף רגישות: אם הווליום מעל 15%, הציג פה פתוח
+        return open_clip.get_frame(t) if volumes[idx] > 0.15 else closed_clip.get_frame(t)
+
+    def make_mask(t):
+        idx = min(int(t * fps), len(volumes) - 1)
+        return open_clip.mask.get_frame(t) if volumes[idx] > 0.15 else closed_clip.mask.get_frame(t)
+
+    # יצירת הווידאו של הדמות
+    dynamic_avatar = VideoClip(make_frame, duration=duration)
+    dynamic_mask = VideoClip(make_mask, duration=duration, is_mask=True)
+    dynamic_avatar = dynamic_avatar.with_mask(dynamic_mask)
+
+    # 4. הוספת תנועת גוף מעלה-מטה (Bobbing Effect) כשהדמות מדברת
+    def avatar_pos(t):
+        idx = min(int(t * fps), len(volumes) - 1)
+        vol = volumes[idx]
+        base_x = 1500  # ממוקם בצד ימין על המסך
+        base_y = 650  # יושב מעל הכתוביות
+        # הדמות קופצת למעלה עד 20 פיקסלים בהתאם לעוצמת הצעקה/דיבור
+        bob_offset = int(vol * 20) if vol > 0.15 else 0
+        return (base_x, base_y - bob_offset)
+
+    return dynamic_avatar.with_position(avatar_pos)
+
+
+# ---------------------------------------------------------
+# Helper: Extract clean audio peaks for lip sync
+# ---------------------------------------------------------
+def get_audio_peaks(audio_path: str, fps: int = 30) -> np.ndarray:
+    """מחלצת את עוצמות הקול (RMS) עבור כל פריים בסרטון בצורה מדויקת."""
+    audio_clip = AudioFileClip(audio_path)
+    sr = 22050  # קצב דגימה קבוע
+    audio_array = audio_clip.to_soundarray(fps=sr)
+    if audio_array.ndim == 2:
+        audio_array = audio_array.mean(axis=1)
+
+    total_frames = int(audio_clip.duration * fps)
+    samples_per_frame = int(sr / fps)
+
+    volumes = []
+    for f in range(total_frames):
+        start = f * samples_per_frame
+        end = start + samples_per_frame
+        chunk = audio_array[start:end]
+        if len(chunk) > 0:
+            vol = np.sqrt(np.mean(chunk ** 2))  # עוצמת RMS
+        else:
+            vol = 0.0
+        volumes.append(vol)
+
+    audio_clip.close()
+
+    volumes = np.array(volumes)
+    max_vol = np.max(volumes) if np.max(volumes) > 0 else 1.0
+    return volumes / max_vol
 
 def draw_news_ticker_bar(fig, raw_ticker_text: str, global_t: float, scroll_speed: float = 0.06):
     """מציירת את פס החדשות הרץ בראש ה-Figure לפי זמן גלובלי (global_t) לרצף מושלם בכל הסרטון."""
