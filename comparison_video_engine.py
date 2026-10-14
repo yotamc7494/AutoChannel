@@ -4,30 +4,27 @@ import tempfile
 import random
 import json
 import urllib.request
-import numpy as np
+import shutil
+import subprocess
+from functools import lru_cache
 from io import BytesIO
-from google import genai
-from google.genai import types
+
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from scipy.interpolate import PchipInterpolator
 import requests
 from PIL import Image, ImageDraw, ImageEnhance
+
 if not hasattr(Image, 'ANTIALIAS'):
-    Image.ANTIALIAS = Image.LANCZOS
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import yfinance as yf
-from moviepy import (
-    AudioFileClip,
-    VideoFileClip,
-    VideoClip,
-    CompositeVideoClip,
-    CompositeAudioClip,
-    concatenate_videoclips,
-)
-import moviepy.audio.fx as afx
-import moviepy.video.fx as vfx
+
 from uploader import upload_video
 
 SECTORS = {
@@ -43,7 +40,6 @@ SECTORS = {
 
 # --- פלטות צבעים כהות ויוקרתיות לרקע ---
 BACKGROUND_PALETTES = [
-    # 1. Slate Blue / Dark Navy (הקלאסי)
     {
         "bg1": (24, 32, 47, 255),
         "bg2": (15, 19, 28, 255),
@@ -51,7 +47,6 @@ BACKGROUND_PALETTES = [
         "card_bg": "#141A26",
         "grid": "#2A3447",
     },
-    # 2. Midnight Purple (סגול כהה עמוק)
     {
         "bg1": (32, 22, 48, 255),
         "bg2": (18, 12, 28, 255),
@@ -59,7 +54,6 @@ BACKGROUND_PALETTES = [
         "card_bg": "#1B1226",
         "grid": "#3B2854",
     },
-    # 3. Dark Emerald / Forest (ירוק אמרלד כהה - מומלץ למניות)
     {
         "bg1": (18, 38, 32, 255),
         "bg2": (10, 22, 18, 255),
@@ -67,7 +61,6 @@ BACKGROUND_PALETTES = [
         "card_bg": "#0F211C",
         "grid": "#22453A",
     },
-    # 4. Deep Crimson / Wine (בורדו/יין כהה)
     {
         "bg1": (42, 20, 28, 255),
         "bg2": (25, 11, 16, 255),
@@ -75,7 +68,6 @@ BACKGROUND_PALETTES = [
         "card_bg": "#210F16",
         "grid": "#4A2231",
     },
-    # 5. Obsidian Charcoal (אפור פחם / ניטרלי)
     {
         "bg1": (35, 35, 38, 255),
         "bg2": (18, 18, 20, 255),
@@ -83,7 +75,6 @@ BACKGROUND_PALETTES = [
         "card_bg": "#1C1C1E",
         "grid": "#3A3A3C",
     },
-    # 6. Deep Indigo / Cyber Dark (אינדיגו/סייבר)
     {
         "bg1": (20, 28, 55, 255),
         "bg2": (12, 16, 32, 255),
@@ -93,18 +84,11 @@ BACKGROUND_PALETTES = [
     },
 ]
 
-DYNAMIC_FONTS = ["DejaVu Sans", "Arial", "Impact", "Trebuchet MS", "Verdana"]
-
 load_dotenv()
 
-# --- הגדרות עיצוב ומסלולים ---
-BG_COLOR = "#131722"
-GRID_COLOR = "#2A3447"
-# מסלולים לתיקיות נכסים
 LOGOS_DIR = "assets/logos"
 TRADING_FLOOR_DIR = "assets/trading_floor_videos"
 
-# הגדרת פונט תומך Unicode באופן גלובלי
 plt.rcParams['font.family'] = ['Segoe UI Emoji', 'DejaVu Sans']
 
 try:
@@ -115,26 +99,34 @@ except Exception:
     pass
 
 
+@lru_cache(maxsize=1)
+def ffmpeg_exe() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        raise RuntimeError("ffmpeg not found. Install ffmpeg or `pip install imageio-ffmpeg`.")
+
+
 def get_ticker_logo(ticker):
     """מורידה לוגו שקוף אוטומטית מ-CDN עם אימות תקינות הקובץ."""
-    logos_dir = "assets/logos"
-    os.makedirs(logos_dir, exist_ok=True)
-    logo_path = os.path.join(logos_dir, f"{ticker}.png")
+    os.makedirs(LOGOS_DIR, exist_ok=True)
+    logo_path = os.path.join(LOGOS_DIR, f"{ticker}.png")
 
-    # בדיקה אם הקובץ קיים ותקין
     if os.path.exists(logo_path):
         try:
             with Image.open(logo_path) as img:
                 img.verify()
             return logo_path
         except Exception:
-            # הקובץ קיים אך פגום - נמחק אותו כדי להוריד מחדש
             try:
                 os.remove(logo_path)
             except Exception:
                 pass
 
-    # ניסיונות משיכה מ-APIs ציבוריים
     urls = [
         f"https://assets.parqet.com/logos/symbol/{ticker}",
         f"https://financialmodelingprep.com/image-stock/{ticker}.png",
@@ -150,12 +142,8 @@ def get_ticker_logo(ticker):
                 data = resp.read()
                 if len(data) < 500:
                     continue
-
-                # אימות שהנתונים שהתקבלו הם תמונה תקינה לפני שמירה
                 img = Image.open(BytesIO(data))
                 img.verify()
-
-                # המרה ל-RGBA ושמירה כ-PNG תקין
                 img = Image.open(BytesIO(data)).convert("RGBA")
                 img.save(logo_path, "PNG")
                 return logo_path
@@ -165,26 +153,16 @@ def get_ticker_logo(ticker):
     return None
 
 
-def prepare_image_background_and_thumbnail(
-    ticker1, ticker2, palette=None, width=1080, height=1920
-):
-    """
-    יוצרת Thumbnail מוארת ותמונת רקע מושחרת לפי פלטת צבעים דינמית.
-    """
-    if palette is None:
-        palette = random.choice(BACKGROUND_PALETTES)
-
+def prepare_image_background_and_thumbnail(ticker1, ticker2, palette, width=1080, height=1920):
     bg1 = palette["bg1"]
     bg2 = palette["bg2"]
     line_color = palette["line"]
 
-    # יצירת בסיס הרקע
     bg = Image.new("RGBA", (width, height), bg2)
     draw = ImageDraw.Draw(bg)
 
     comp_type = random.choice(["diagonal", "horizontal", "vertical"])
 
-    # ציור הגרפיקה לפי הפלטה הדינמית
     if comp_type == "diagonal":
         poly_tl = [(0, 0), (width, 0), (0, height)]
         poly_br = [(width, 0), (width, height), (0, height)]
@@ -194,17 +172,12 @@ def prepare_image_background_and_thumbnail(
     elif comp_type == "horizontal":
         draw.rectangle([(0, 0), (width, height // 2)], fill=bg1)
         draw.rectangle([(0, height // 2), (width, height)], fill=bg2)
-        draw.line(
-            [(0, height // 2), (width, height // 2)], fill=line_color, width=12
-        )
+        draw.line([(0, height // 2), (width, height // 2)], fill=line_color, width=12)
     else:  # vertical
         draw.rectangle([(0, 0), (width // 2, height)], fill=bg1)
         draw.rectangle([(width // 2, 0), (width, height)], fill=bg2)
-        draw.line(
-            [(width // 2, 0), (width // 2, height)], fill=line_color, width=12
-        )
+        draw.line([(width // 2, 0), (width // 2, height)], fill=line_color, width=12)
 
-    # מיקום הלוגואים
     logo1_path = get_ticker_logo(ticker1)
     logo2_path = get_ticker_logo(ticker2)
     logo_size = 380
@@ -214,10 +187,7 @@ def prepare_image_background_and_thumbnail(
             try:
                 img = Image.open(logo_path).convert("RGBA")
                 img.thumbnail((logo_size, logo_size), Image.Resampling.LANCZOS)
-                pos = (
-                    int(center_pos[0] - img.width / 2),
-                    int(center_pos[1] - img.height / 2),
-                )
+                pos = (int(center_pos[0] - img.width / 2), int(center_pos[1] - img.height / 2))
                 bg_img.paste(img, pos, img)
             except Exception as e:
                 print(f"⚠️ Failed to paste logo {logo_path}: {e}")
@@ -237,10 +207,8 @@ def prepare_image_background_and_thumbnail(
     thumb_path = os.path.join(temp_dir, f"thumb_{unique_id}.png")
     dark_bg_path = os.path.join(temp_dir, f"dark_bg_{unique_id}.png")
 
-    # 1. שמירת Thumbnail (בהיר)
     bg.convert("RGB").save(thumb_path, quality=95)
 
-    # 2. שמירת רקע מושחר (35% בהירות)
     enhancer = ImageEnhance.Brightness(bg)
     dark_bg = enhancer.enhance(0.35)
     dark_bg.convert("RGB").save(dark_bg_path)
@@ -249,12 +217,10 @@ def prepare_image_background_and_thumbnail(
 
 
 def fetch_yahoo_chart_direct(ticker, period="max", interval="1wk"):
-    """מושך נתוני מניה ישירות מ-API ה-Chart של Yahoo Finance."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={period}&interval={interval}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
     }
-
     for attempt in range(3):
         try:
             response = requests.get(url, headers=headers, timeout=10)
@@ -270,62 +236,13 @@ def fetch_yahoo_chart_direct(ticker, period="max", interval="1wk"):
                 )
                 df.index = df.index.tz_localize(None)
                 df = df.dropna()
-
                 if not df.empty:
                     return df["Close"]
             elif response.status_code == 429:
                 time.sleep(3)
         except Exception:
             time.sleep(2)
-
     return pd.Series(dtype=float)
-
-
-def prepare_video_background(target_duration, width=1080, height=1920):
-    """
-    בוחרת ווידאו אקראי מהתיקייה, הופכת אותו ללופ כדי להתאים לזמן היעד,
-    ומשחירה אותו.
-    """
-    if not os.path.exists(TRADING_FLOOR_DIR):
-        print(f"⚠️ Folder {TRADING_FLOOR_DIR} not found.")
-        return None
-
-    video_files = [f for f in os.listdir(TRADING_FLOOR_DIR) if f.endswith(".mp4")]
-    if not video_files:
-        print(f"⚠️ No trading floor videos found in {TRADING_FLOOR_DIR}, using image fallback.")
-        return None
-
-    # בחירת ווידאו אקראי (1, 2, או 3)
-    selected_video = random.choice(video_files)
-    video_path = os.path.join(TRADING_FLOOR_DIR, selected_video)
-
-    try:
-        # טעינת הווידאו
-        bg_clip = VideoFileClip(video_path)
-
-        # התאמת גודל: קודם resize לגובה, ואז crop למרכז כדי לקבל 1080x1920
-        bg_clip = bg_clip.resize(height=height) # גובה 1920
-        current_w = bg_clip.w
-        left_crop = (current_w - width) / 2
-        bg_clip = bg_clip.crop(x1=left_crop, width=width, height=height)
-
-        # יצירת לופ במידה והווידאו קצר מדי
-        if bg_clip.duration < target_duration:
-            bg_clip = bg_clip.fx(afx.audio_loop, duration=target_duration)
-
-        # חיתוך מדויק לזמן היעד
-        bg_clip = bg_clip.subclip(0, target_duration)
-
-        # השחרה / עמעום (vfx.colorx - מכפיל את הצבעים ב-0.25 להכהיה משמעותית)
-        bg_clip = bg_clip.fx(vfx.colorx, 0.25)
-
-        # הסרת שמע מקורי מהרקע
-        bg_clip = bg_clip.set_audio(None)
-
-        return bg_clip
-    except Exception as e:
-        print(f"⚠️ Error preparing video background {video_path}: {e}")
-        return None
 
 
 def get_comparison_data(ticker1, ticker2, initial_investment=100):
@@ -355,340 +272,11 @@ def get_comparison_data(ticker1, ticker2, initial_investment=100):
     return v1, v2, start_date.year
 
 
-def make_animated_comparison_chart(
-    v1,
-    v2,
-    ticker1,
-    ticker2,
-    start_year,
-    investment,
-    duration,
-    color1,
-    color2,
-    header_text,
-    palette,  # <-- מקבל את פלטת הצבעים
-    dark_bg_path=None,
-    bg_clip=None,
-    show_fill=True,
-    size=(1080, 1920),
-):
-    size = (int(size[0]), int(size[1]))
-
-    n_original = len(v1)
-    n_dense = 1000
-    x_orig = np.arange(n_original)
-    x_dense = np.linspace(0, n_original - 1, n_dense)
-
-    interp_1 = PchipInterpolator(x_orig, v1.values)
-    interp_2 = PchipInterpolator(x_orig, v2.values)
-
-    y1_dense = interp_1(x_dense)
-    y2_dense = interp_2(x_dense)
-
-    bg_array = None
-    if dark_bg_path and os.path.exists(dark_bg_path):
-        bg_pil = Image.open(dark_bg_path).convert("RGB").resize(size)
-        bg_array = np.array(bg_pil, dtype=np.float32)
-
-    fig, ax = plt.subplots(figsize=(size[0] / 100, size[1] / 100), dpi=100)
-    canvas = FigureCanvasAgg(fig)
-
-    # כותרת עליונה משתמשת ב-card_bg ו-grid מתוך הפלטה
-    fig.text(
-        0.5,
-        0.90,
-        header_text,
-        color="white",
-        fontsize=26,
-        fontweight="bold",
-        ha="center",
-        va="top",
-        bbox=dict(
-            boxstyle="square,pad=0.5",
-            facecolor=palette["card_bg"],
-            edgecolor=palette["grid"],
-            alpha=0.9,
-        ),
-    )
-
-    date_text_obj = fig.text(
-        0.5,
-        0.82,
-        "",
-        color="white",
-        fontsize=24,
-        fontweight="bold",
-        ha="center",
-        va="top",
-    )
-
-    try:
-        dates = v1.index.strftime("%b %Y")
-    except AttributeError:
-        dates = [str(start_year)] * n_original
-
-    def render_rgba_frame(t):
-        ax.clear()
-
-        fig.patch.set_alpha(0.0)
-        ax.set_facecolor("none")
-
-        # גריד דינמי לפי הפלטה
-        ax.grid(
-            True,
-            color=palette["grid"],
-            linestyle="--",
-            linewidth=1,
-            alpha=0.5,
-        )
-
-        progress = min(t / duration, 1.0)
-        idx = max(1, int(progress * (n_dense - 1)))
-
-        idx_orig = int(progress * (n_original - 1))
-        idx_orig = min(max(0, idx_orig), n_original - 1)
-        date_text_obj.set_text(dates[idx_orig])
-
-        sub_x = x_dense[: idx + 1]
-        sub_y1 = y1_dense[: idx + 1]
-        sub_y2 = y2_dense[: idx + 1]
-
-        ax.plot(sub_x, sub_y1, color=color1, linewidth=6, label=ticker1)
-        ax.plot(sub_x, sub_y2, color=color2, linewidth=6, label=ticker2)
-
-        if show_fill:
-            ax.fill_between(
-                sub_x, sub_y1, min(sub_y1), color=color1, alpha=0.15
-            )
-            ax.fill_between(
-                sub_x, sub_y2, min(sub_y2), color=color2, alpha=0.15
-            )
-
-        ax.plot(sub_x[-1], sub_y1[-1], marker="o", markersize=12, color=color1)
-        ax.plot(sub_x[-1], sub_y2[-1], marker="o", markersize=12, color=color2)
-
-        v1_curr = sub_y1[-1]
-        v2_curr = sub_y2[-1]
-
-        crown_icon = "\U0001F451"
-
-        if v1_curr >= v2_curr:
-            label1_str = f"{ticker1} {crown_icon}\n${v1_curr:,.1f}"
-            label2_str = f"{ticker2}\n${v2_curr:,.1f}"
-        else:
-            label1_str = f"{ticker1}\n${v1_curr:,.1f}"
-            label2_str = f"{ticker2} {crown_icon}\n${v2_curr:,.1f}"
-
-        current_y_max = max(np.max(sub_y1), np.max(sub_y2))
-        current_y_min = min(np.min(sub_y1), np.min(sub_y2))
-        ax.set_ylim(current_y_min * 0.85, current_y_max * 1.35)
-
-        x_max = max(10, sub_x[-1])
-        ax.set_xlim(-(x_max * 0.05), x_max + (x_max * 0.15))
-
-        # תיבות טקסט משתמשות ב-card_bg מתוך הפלטה
-        ax.text(
-            sub_x[-1],
-            v1_curr + (current_y_max * 0.03),
-            label1_str,
-            color=color1,
-            fontsize=24,
-            fontweight="bold",
-            ha="center",
-            va="bottom",
-            bbox=dict(
-                boxstyle="round,pad=0.3",
-                facecolor=palette["card_bg"],
-                edgecolor=color1,
-                alpha=0.85,
-            ),
-        )
-
-        ax.text(
-            sub_x[-1],
-            v2_curr + (current_y_max * 0.03),
-            label2_str,
-            color=color2,
-            fontsize=24,
-            fontweight="bold",
-            ha="center",
-            va="bottom",
-            bbox=dict(
-                boxstyle="round,pad=0.3",
-                facecolor=palette["card_bg"],
-                edgecolor=color2,
-                alpha=0.85,
-            ),
-        )
-
-        ax.tick_params(axis="both", colors="white", labelsize=18)
-        ax.set_xticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        canvas.draw()
-
-        chart_rgba = np.asarray(canvas.buffer_rgba())
-        alpha = (chart_rgba[:, :, 3:4].astype(np.float32)) / 255.0
-        chart_rgb = chart_rgba[:, :, :3].astype(np.float32)
-
-        if bg_clip is not None:
-            current_bg = bg_clip.get_frame(t).astype(np.float32)
-        elif bg_array is not None:
-            current_bg = bg_array
-        else:
-            # פולבק לצבע הרקע הראשון מהפלטה
-            current_bg = np.full(
-                (size[1], size[0], 3), palette["bg2"][:3], dtype=np.float32
-            )
-
-        blended = (chart_rgb * alpha + current_bg * (1.0 - alpha)).astype(
-            np.uint8
-        )
-        return blended
-
-    chart_clip = VideoClip(render_rgba_frame, duration=duration)
-    plt.close(fig)
-    return chart_clip
-
-def create_comparison_fomo_video(
-    ticker1,
-    ticker2,
-    sector_name,
-    music_path,
-    investment,
-    output_filename="fomo_comparison.mp4",
-):
-    duration = random.randint(25, 35)
-    fps = 15
-    width, height = 1080, 1920
-
-    v1, v2, start_year = get_comparison_data(ticker1, ticker2, investment)
-    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
-        print(
-            f"❌ Insufficient price data for {ticker1} vs {ticker2}. Skipping...",
-            flush=True,
-        )
-        return None, None
-
-    # 🟢 1. הגרלת פלטת צבעים אחת לכל הרינדור (Thumbnail + Video)
-    selected_palette = random.choice(BACKGROUND_PALETTES)
-
-    print(
-        f"🎬 Generating {duration}s Video For {ticker1} vs {ticker2} ({sector_name})",
-        flush=True,
-    )
-
-    # 🟢 2. הכנת Thumbnail והרקע הסטטי עם הפלטה שנבחרה
-    thumb_path, dark_image_bg_path = prepare_image_background_and_thumbnail(
-        ticker1, ticker2, palette=selected_palette, width=width, height=height
-    )
-
-    palette = [
-        "#00E676",
-        "#FF1744",
-        "#29B6F6",
-        "#FFA000",
-        "#E040FB",
-        "#1DE9B6",
-        "#FFEA00",
-    ]
-    c1, c2 = random.sample(palette, 2)
-
-    ai_data = generate_fomo_metadata_and_header_with_ai(
-        ticker1, ticker2, sector_name, investment, start_year
-    )
-
-    show_fill = random.random() > 0.30
-
-    background_type = random.choice(["video", "logos"])
-
-    bg_clip = None
-    dark_bg_for_chart = None
-
-    if background_type == "video":
-        print("🟢 Using darkened trading floor video background.", flush=True)
-        bg_clip = prepare_video_background(duration, width, height)
-        if bg_clip is None:
-            background_type = "logos"
-
-    if background_type == "logos":
-        print(
-            "🟢 Using static darkened logo composition background.", flush=True
-        )
-        dark_bg_for_chart = dark_image_bg_path
-
-    # 🟢 3. יצירת הגרף תוך שימוש בפלטה שנבחרה
-    final_video = make_animated_comparison_chart(
-        v1,
-        v2,
-        ticker1,
-        ticker2,
-        start_year,
-        investment,
-        duration,
-        c1,
-        c2,
-        ai_data["video_header"],
-        palette=selected_palette,  # <-- העברת הפלטה
-        dark_bg_path=dark_bg_for_chart,
-        bg_clip=bg_clip,
-        show_fill=show_fill,
-        size=(width, height),
-    )
-
-    freeze_frame = final_video.to_ImageClip(t=duration - 0.1).with_duration(1.0)
-    final_video = concatenate_videoclips([final_video, freeze_frame])
-
-    total_duration = duration + 1.0
-
-    
-
-    if music_path and os.path.exists(music_path):
-        bg_music = AudioFileClip(music_path)
-        if bg_music.duration < total_duration:
-            bg_music = bg_music.fx(afx.audio_loop, duration=total_duration)
-
-        bg_music = (
-            bg_music.subclipped(0, total_duration)
-            .with_effects([
-                afx.MultiplyVolume(0.15),
-                afx.AudioFadeOut(2)
-            ])
-        )
-        final_video = final_video.with_audio(bg_music)
-
-    print(f"🎬 Rendering final video: {output_filename}...", flush=True)
-
-    final_video.write_videofile(
-        output_filename,
-        fps=fps,
-        codec="libx264",
-        audio_codec="aac",
-        audio_fps=44100,
-        temp_audiofile="temp-audio.m4a",
-        remove_temp=True,
-        threads=os.cpu_count() or 4,
-        preset="ultrafast",
-        write_logfile=False,
-    )
-
-    final_video.close()
-    if bg_clip is not None:
-        bg_clip.close()
-
-    print("✅ Done!", flush=True)
-    return ai_data, thumb_path
-
-
-def generate_fomo_metadata_and_header_with_ai(
-        ticker1, ticker2, sector_name, investment, start_year
-):
+def generate_fomo_metadata_and_header_with_ai(ticker1, ticker2, sector_name, investment, start_year):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         try:
             import streamlit as st
-
             api_key = st.secrets.get("GEMINI_API_KEY")
         except Exception:
             pass
@@ -698,23 +286,16 @@ def generate_fomo_metadata_and_header_with_ai(
 
     client = genai.Client(api_key=api_key)
 
-    # 1. הגרלת זווית/סגנון כתיבה שונה בכל הרצה למניעת חזרתיות
     CREATIVE_ANGLES = [
-        f"REGRET & FOMO: Focus on the pain of choosing the wrong stock in {start_year} (e.g. 'If only you picked...')",
-        f"BRUTAL WAR: Frame it as an aggressive battle between {sector_name} giants (e.g. 'DESTROYED', 'CRUSHED')",
+        f"REGRET & FOMO: Focus on the pain of choosing the wrong stock in {start_year}",
+        f"BRUTAL WAR: Frame it as an aggressive battle between {sector_name} giants",
         f"WEALTH / ROI: Focus purely on the massive stack of money made from ${investment}",
         f"MYSTERY / SHOCK: Frame it as a surprising twist that nobody expected",
-        f"INVESTOR COMPARISON: Ask a direct, provocative question to investors in this sector",
+        f"INVESTOR COMPARISON: Ask a direct, provocative question to investors",
     ]
     chosen_angle = random.choice(CREATIVE_ANGLES)
 
-    # 2. הגרלת פלטת אימוג'ים מועדפת כדי שלא יחזור על 🚀 בכל כותרת
-    EMOJI_SETS = [
-        "⚔️, 💥, 🥊, 💣",
-        "👑, 🏆, 🥇, 💰",
-        "🤯, 🚨, 🔥, 😱",
-        "📊, 📉, 📈, 💵",
-    ]
+    EMOJI_SETS = ["⚔️, 💥, 🥊, 💣", "👑, 🏆, 🥇, 💰", "🤯, 🚨, 🔥, 😱", "📊, 📉, 📈, 💵"]
     chosen_emojis = random.choice(EMOJI_SETS)
 
     prompt = f"""
@@ -730,51 +311,294 @@ def generate_fomo_metadata_and_header_with_ai(
         {chosen_angle}
 
         STRICT RULES FOR DIVERSITY:
-        1. "video_header": 3 to 5 words MAX in ALL CAPS for the overlay on top of the video. Make it punchy!
-        2. "youtube_title": NO CLICHÉS! DO NOT use boring formats like "{ticker1} vs {ticker2}: Who Won?". 
-           - Use diverse hook styles (Questions, Shocking Statements, Regret Hooks).
-           - Primary emojis to draw inspiration from for this video: {chosen_emojis}
-        3. "description": Punchy summary ending with an engaging question to force viewers to comment.
+        1. "video_header": 3 to 5 words MAX in ALL CAPS for the overlay on top of the video.
+        2. "youtube_title": NO CLICHÉS! DO NOT use boring formats. Use diverse hooks. Emojis: {chosen_emojis}
+        3. "description": Punchy summary ending with an engaging question.
         4. "tags": 5-7 comma-separated tags.
 
         STRICT OUTPUT FORMAT:
-        Return ONLY a valid JSON object with the following 4 fields:
+        Return ONLY a valid JSON object:
         {{
-          "video_header": "SHORT ON-SCREEN HEADER IN ALL CAPS",
-          "youtube_title": "Highly creative and unique title with emojis",
-          "description": "Engaging description ending with a comment question",
-          "tags": "tag1,tag2,tag3,tag4,tag5"
+          "video_header": "SHORT ON-SCREEN HEADER",
+          "youtube_title": "Creative title",
+          "description": "Engaging description",
+          "tags": "tag1,tag2,tag3"
         }}
-        """
-
-    # 3. שימוש ב-temperature=1.0 כדי להבטיח יצירתיות ואקראיות גבוהה
+    """
     response = client.models.generate_content(
         model="gemini-flash-lite-latest",
         contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=1.0,  # <-- מעלה את רמת הגיוון והאקראיות
-        ),
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=1.0)
     )
-
     return json.loads(response.text)
 
 
+# =====================================================================
+# FFmpeg Render Engine (Replaces moviepy)
+# =====================================================================
+def get_bg_frames(video_path, width, height, fps, total_frames):
+    """שואב פריימים גולמיים מווידאו הרקע באמצעות FFmpeg כדי לשלב אותם בזיכרון."""
+    cmd = [
+        ffmpeg_exe(), '-loglevel', 'error',
+        '-stream_loop', '-1', '-i', video_path,
+        # חותך למרכז ומכהה משמעותית (מדמה את vfx.colorx(0.25))
+        '-vf', f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+               f"colorlevels=romax=0.25:gomax=0.25:bomax=0.25",
+        '-r', str(fps),
+        '-f', 'image2pipe', '-pix_fmt', 'rgb24', '-vcodec', 'rawvideo', '-'
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=width * height * 3 * 5)
+    frame_size = width * height * 3
+
+    try:
+        for _ in range(total_frames):
+            raw = proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            yield np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3)).astype(np.float32)
+    finally:
+        proc.kill()
+
+
+def render_chart_video_to_disk(
+        v1, v2, ticker1, ticker2, start_year, duration, color1, color2,
+        header_text, palette, dark_bg_path, bg_video_path, show_fill,
+        width, height, fps, output_path
+):
+    """מצייר את הגרף ב-Matplotlib ומזרים את הפיקסלים ישירות ל-FFmpeg כדי לקודד קובץ וידאו חסר קול."""
+    total_frames = int(duration * fps)
+    freeze_frames = int(1.0 * fps)  # מסגרת קפואה בסוף של שנייה אחת
+
+    n_original = len(v1)
+    n_dense = 1000
+    x_orig = np.arange(n_original)
+    x_dense = np.linspace(0, n_original - 1, n_dense)
+
+    y1_dense = PchipInterpolator(x_orig, v1.values)(x_dense)
+    y2_dense = PchipInterpolator(x_orig, v2.values)(x_dense)
+
+    # הכנת מטמון לרקע (וידאו או תמונה)
+    bg_generator = None
+    static_bg = None
+    if bg_video_path and os.path.exists(bg_video_path):
+        bg_generator = get_bg_frames(bg_video_path, width, height, fps, total_frames + freeze_frames)
+    elif dark_bg_path and os.path.exists(dark_bg_path):
+        bg_pil = Image.open(dark_bg_path).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        static_bg = np.array(bg_pil, dtype=np.float32)
+    else:
+        static_bg = np.full((height, width, 3), palette["bg2"][:3], dtype=np.float32)
+
+    # הכנת משטח הציור של Matplotlib (בלי חלון אמיתי)
+    fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    canvas = FigureCanvasAgg(fig)
+
+    fig.text(0.5, 0.90, header_text, color="white", fontsize=26, fontweight="bold",
+             ha="center", va="top", bbox=dict(boxstyle="square,pad=0.5", facecolor=palette["card_bg"],
+                                              edgecolor=palette["grid"], alpha=0.9))
+    date_text_obj = fig.text(0.5, 0.82, "", color="white", fontsize=24, fontweight="bold", ha="center", va="top")
+
+    try:
+        dates = v1.index.strftime("%b %Y")
+    except AttributeError:
+        dates = [str(start_year)] * n_original
+
+    # פתיחת תהליך FFmpeg כדי לקלוט פריימים וליצור קובץ MP4
+    out_cmd = [
+        ffmpeg_exe(), '-y', '-loglevel', 'error',
+        '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{width}x{height}', '-r', str(fps),
+        '-i', '-', '-an',  # אין שמע עדיין
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '8000k', '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+    out_proc = subprocess.Popen(out_cmd, stdin=subprocess.PIPE)
+
+    last_frame = None
+
+    # לולאת רינדור פריימים
+    for frame_idx in range(total_frames):
+        t = frame_idx / fps
+        ax.clear()
+        fig.patch.set_alpha(0.0)
+        ax.set_facecolor("none")
+        ax.grid(True, color=palette["grid"], linestyle="--", linewidth=1, alpha=0.5)
+
+        progress = min(t / duration, 1.0)
+        idx = max(1, int(progress * (n_dense - 1)))
+        idx_orig = min(max(0, int(progress * (n_original - 1))), n_original - 1)
+
+        date_text_obj.set_text(dates[idx_orig])
+
+        sub_x, sub_y1, sub_y2 = x_dense[:idx + 1], y1_dense[:idx + 1], y2_dense[:idx + 1]
+
+        ax.plot(sub_x, sub_y1, color=color1, linewidth=6, label=ticker1)
+        ax.plot(sub_x, sub_y2, color=color2, linewidth=6, label=ticker2)
+
+        if show_fill:
+            ax.fill_between(sub_x, sub_y1, min(sub_y1), color=color1, alpha=0.15)
+            ax.fill_between(sub_x, sub_y2, min(sub_y2), color=color2, alpha=0.15)
+
+        ax.plot(sub_x[-1], sub_y1[-1], marker="o", markersize=12, color=color1)
+        ax.plot(sub_x[-1], sub_y2[-1], marker="o", markersize=12, color=color2)
+
+        v1_curr, v2_curr = sub_y1[-1], sub_y2[-1]
+        crown_icon = "\U0001F451"
+
+        if v1_curr >= v2_curr:
+            l1_str, l2_str = f"{ticker1} {crown_icon}\n${v1_curr:,.1f}", f"{ticker2}\n${v2_curr:,.1f}"
+        else:
+            l1_str, l2_str = f"{ticker1}\n${v1_curr:,.1f}", f"{ticker2} {crown_icon}\n${v2_curr:,.1f}"
+
+        current_y_max = max(np.max(sub_y1), np.max(sub_y2))
+        current_y_min = min(np.min(sub_y1), np.min(sub_y2))
+        ax.set_ylim(current_y_min * 0.85, current_y_max * 1.35)
+
+        x_max = max(10, sub_x[-1])
+        ax.set_xlim(-(x_max * 0.05), x_max + (x_max * 0.15))
+
+        ax.text(sub_x[-1], v1_curr + (current_y_max * 0.03), l1_str, color=color1, fontsize=24, fontweight="bold",
+                ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.3", facecolor=palette["card_bg"],
+                                                    edgecolor=color1, alpha=0.85))
+        ax.text(sub_x[-1], v2_curr + (current_y_max * 0.03), l2_str, color=color2, fontsize=24, fontweight="bold",
+                ha="center", va="bottom", bbox=dict(boxstyle="round,pad=0.3", facecolor=palette["card_bg"],
+                                                    edgecolor=color2, alpha=0.85))
+
+        ax.tick_params(axis="both", colors="white", labelsize=18)
+        ax.set_xticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # המרת הגרף למערך נתונים RGB ו-Alpha
+        canvas.draw()
+        chart_rgba = np.asarray(canvas.buffer_rgba())
+        alpha = (chart_rgba[:, :, 3:4].astype(np.float32)) / 255.0
+        chart_rgb = chart_rgba[:, :, :3].astype(np.float32)
+
+        # טעינת פריים רקע
+        current_bg = static_bg
+        if bg_generator is not None:
+            try:
+                current_bg = next(bg_generator)
+            except StopIteration:
+                pass
+
+        # ערבוב השכבות ושליחה ל-FFmpeg
+        blended = (chart_rgb * alpha + current_bg * (1.0 - alpha)).astype(np.uint8)
+        last_frame = blended
+        out_proc.stdin.write(blended.tobytes())
+
+    # פריים קפוא (השהיה בסוף)
+    if last_frame is not None:
+        for _ in range(freeze_frames):
+            if bg_generator is not None:
+                try:
+                    current_bg = next(bg_generator)
+                    blended = (chart_rgb * alpha + current_bg * (1.0 - alpha)).astype(np.uint8)
+                    out_proc.stdin.write(blended.tobytes())
+                except StopIteration:
+                    out_proc.stdin.write(last_frame.tobytes())
+            else:
+                out_proc.stdin.write(last_frame.tobytes())
+
+    out_proc.stdin.close()
+    out_proc.wait()
+    plt.close(fig)
+
+
+def mix_audio_and_video(silent_video_path, music_path, output_path, total_duration):
+    """מוסיפה מוזיקת רקע לווידאו המרונדר עם Fade Out בסיום (Stream Copy מהיר מאוד)."""
+    if not music_path or not os.path.exists(music_path):
+        shutil.copy(silent_video_path, output_path)
+        return
+
+    fade_start = max(0.0, total_duration - 2.0)
+    cmd = [
+        ffmpeg_exe(), '-y', '-loglevel', 'error',
+        '-i', silent_video_path,
+        '-stream_loop', '-1', '-i', music_path,
+        # הגדרת עוצמה ודהייה בסוף
+        '-filter_complex', f"[1:a]volume=0.15,afade=t=out:st={fade_start}:d=2[aout]",
+        '-map', '0:v:0', '-map', '[aout]',
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart',
+        '-t', str(total_duration),
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def create_comparison_fomo_video(ticker1, ticker2, sector_name, music_path, investment,
+                                 output_filename="fomo_comparison.mp4"):
+    duration = random.randint(25, 35)
+    fps = 15
+    width, height = 1080, 1920
+
+    v1, v2, start_year = get_comparison_data(ticker1, ticker2, investment)
+    if v1 is None or v2 is None or len(v1) < 2 or len(v2) < 2:
+        print(f"❌ Insufficient price data for {ticker1} vs {ticker2}. Skipping...", flush=True)
+        return None, None
+
+    selected_palette = random.choice(BACKGROUND_PALETTES)
+    print(f"🎬 Generating {duration}s Video For {ticker1} vs {ticker2} ({sector_name})", flush=True)
+
+    thumb_path, dark_image_bg_path = prepare_image_background_and_thumbnail(
+        ticker1, ticker2, palette=selected_palette, width=width, height=height
+    )
+
+    palette = ["#00E676", "#FF1744", "#29B6F6", "#FFA000", "#E040FB", "#1DE9B6", "#FFEA00"]
+    c1, c2 = random.sample(palette, 2)
+
+    ai_data = generate_fomo_metadata_and_header_with_ai(ticker1, ticker2, sector_name, investment, start_year)
+    show_fill = random.random() > 0.30
+
+    background_type = random.choice(["video", "logos"])
+    bg_video_path = None
+    dark_bg_for_chart = None
+
+    if background_type == "video":
+        if os.path.exists(TRADING_FLOOR_DIR) and (
+        video_files := [f for f in os.listdir(TRADING_FLOOR_DIR) if f.endswith(".mp4")]):
+            bg_video_path = os.path.join(TRADING_FLOOR_DIR, random.choice(video_files))
+            print("🟢 Using darkened trading floor video background.", flush=True)
+        else:
+            background_type = "logos"
+
+    if background_type == "logos":
+        print("🟢 Using static darkened logo composition background.", flush=True)
+        dark_bg_for_chart = dark_image_bg_path
+
+    # רינדור הווידאו האילם ישירות לכונן באמצעות FFmpeg
+    temp_silent_video = os.path.join(tempfile.gettempdir(), f"silent_{output_filename}")
+
+    render_chart_video_to_disk(
+        v1, v2, ticker1, ticker2, start_year, duration, c1, c2,
+        ai_data["video_header"], selected_palette, dark_bg_for_chart, bg_video_path,
+        show_fill, width, height, fps, temp_silent_video
+    )
+
+    print("🎵 Mixing background music...", flush=True)
+    total_duration = duration + 1.0  # + שנייה אחת של פריים קפוא
+    mix_audio_and_video(temp_silent_video, music_path, output_filename, total_duration)
+
+    # מחיקת הקובץ הזמני (הסרטון האילם)
+    if os.path.exists(temp_silent_video):
+        os.remove(temp_silent_video)
+
+    print(f"✅ Done! Saved to {output_filename}", flush=True)
+    return ai_data, thumb_path
+
+
 def run_generator(test_mode=False):
-    MUSIC_PATH = f"assets/suspense_music/{random.choice([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])}.mp3"
+    MUSIC_PATH = f"assets/suspense_music/{random.choice(range(1, 16))}.mp3"
     if not os.path.exists(MUSIC_PATH):
         MUSIC_PATH = ""
 
-    # 1. בחירת סקטור אקראי
     sector_name, tickers = random.choice(list(SECTORS.items()))
-
-    # 2. בחירת שני טיקרים מתוך אותו סקטור
     ticker1, ticker2 = random.sample(tickers, 2)
 
     output_filename = f"{ticker1}_vs_{ticker2}.mp4"
     investment = random.choice([100, 200, 500, 1000])
     upload_data, thumb_path = None, None
     attempts = 0
+
     while upload_data is None and thumb_path is None:
         attempts += 1
         upload_data, thumb_path = create_comparison_fomo_video(
@@ -796,6 +620,6 @@ def run_generator(test_mode=False):
             )
             return output_filename
 
+
 if __name__ == "__main__":
-    for i in range(5):
-        run_generator(test_mode=True)
+    run_generator(test_mode=True)
