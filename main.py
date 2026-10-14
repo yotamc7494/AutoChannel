@@ -5,7 +5,7 @@ Stages
     1. Config
     2. Helpers          (retry, ffmpeg, audio decoding)
     3. LLM              (Gemini with model rotation + backoff)
-    4. Stock selection  (Redis "used today" set, one batch download, news, company name)
+    4. Stock selection  (Redis "used today" set, one batch download, Google News RSS, company name)
     5. Market metrics   (market cap / S&P 500 / BTC, fetched concurrently, multiple fallbacks)
     6. Script           (Gemini JSON: title, headline, voiceover, description, tags, catalyst_sentences)
     7. TTS              (Piper, local)
@@ -20,6 +20,7 @@ Dependencies: numpy, scipy, matplotlib, Pillow, yfinance, openai-whisper, google
 python-dotenv, requests (+ the `piper` CLI and an ffmpeg binary). moviepy is no longer needed.
 """
 import gc
+import html
 import json
 import logging
 import math
@@ -32,9 +33,12 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -411,55 +415,180 @@ def get_top_moving_stock(test: bool = False) -> dict:
     return best
 
 
-def extract_news_items(news_data, max_articles: int = 3) -> List[dict]:
-    """Structured articles [{provider, title, summary}] from yfinance's news structure."""
-    if not news_data or not isinstance(news_data, list):
-        return []
-    items = []
-    for item in news_data:
-        if len(items) >= max_articles:
-            break
-        content = item.get("content", {}) or {}
-        title = (content.get("title") or "").strip()
-        if not title:
-            continue
-        items.append({
-            "provider": (content.get("provider") or {}).get("displayName", "Market News"),
-            "title": title,
-            "summary": (content.get("summary") or "").strip(),
+# Google News RSS, based on the RSS method in the daily-recap video.
+# Keep the original (prompt_context, news_items) interface unchanged so Gemini
+# and the existing animated news card require no changes.
+COMPANY_NEWS_ALIASES = {
+    "GOOGL": ("Alphabet", "Google"),
+    "MSTR": ("MicroStrategy", "Strategy"),
+    "BRK-B": ("Berkshire Hathaway",),
+    "QQQ": ("Invesco QQQ", "Nasdaq 100"),
+    "SPY": ("S&P 500", "SPDR"),
+    "AMD": ("AMD", "Advanced Micro Devices"),
+    "ARM": ("Arm Holdings",),
+    "META": ("Meta", "Meta Platforms"),
+    "JPM": ("JPMorgan", "JPMorgan Chase"),
+    "LLY": ("Eli Lilly",),
+}
+RSS_NEWS_MAX_ARTICLES = 5
+RSS_NEWS_TIMEOUT = 7  # seconds per request; three searches run concurrently
+
+
+def _rss_company_terms(symbol: str) -> List[str]:
+    """Recognizable company names to search and verify in Google News."""
+    company = COMPANY_NAMES.get(symbol, symbol).strip()
+    choices = list(COMPANY_NEWS_ALIASES.get(symbol, ()))
+    if company and company != symbol:
+        choices.append(company)
+    if company and company != symbol and len(company.split()[0]) >= 4:
+        choices.append(company.split()[0])
+    return list(dict.fromkeys(c for c in choices if c))
+
+
+def _rss_queries(symbol: str) -> List[str]:
+    """Company-specific searches (unlike the broad market RSS used by the other video)."""
+    terms = _rss_company_terms(symbol)
+    queries = [f'"{symbol}" stock']
+    if terms:
+        queries.append(f'"{terms[0]}" stock')
+        queries.append(f'"{terms[0]}" shares OR earnings')
+    return list(dict.fromkeys(queries))
+
+
+def _fetch_rss_headlines(query: str, days: int = 1) -> List[dict]:
+    """Read Google News RSS like the second script; include publisher and timestamp."""
+    url = (
+        'https://news.google.com/rss/search?q='
+        + urllib.parse.quote_plus(f'{query} when:{days}d')
+        + '&hl=en-US&gl=US&ceid=US:en'
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
         })
-    return items
+        with urllib.request.urlopen(req, timeout=RSS_NEWS_TIMEOUT) as resp:
+            root = ET.fromstring(resp.read())
+
+        headlines = []
+        for item in root.findall('.//item')[:10]:
+            title = html.unescape((item.findtext('title') or '').strip())
+            publisher = html.unescape((item.findtext('source') or '').strip())
+            if publisher and title.endswith(' - ' + publisher):
+                title = title[:-(len(publisher) + 3)].strip()
+            elif not publisher and ' - ' in title:
+                title, publisher = title.rsplit(' - ', 1)
+            if not title:
+                continue
+
+            pub_dt = None
+            pub_text = (item.findtext('pubDate') or '').strip()
+            if pub_text:
+                try:
+                    pub_dt = parsedate_to_datetime(pub_text)
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                    pub_dt = pub_dt.astimezone(timezone.utc)
+                except (TypeError, ValueError, IndexError):
+                    pass
+            # No fabricated RSS summaries: Google News' <description> is
+            # often an HTML list of links, not a real article synopsis.
+            headlines.append({
+                'provider': publisher or 'Market News',
+                'title': title,
+                'summary': '',
+                'published': pub_dt.isoformat() if pub_dt else None,
+                '_published_ts': pub_dt.timestamp() if pub_dt else 0.0,
+            })
+        return headlines
+    except Exception as e:
+        logger.warning('Google News RSS query %r (%sd) failed: %s', query, days, e)
+        return []
+
+
+def _rss_title_matches_company(title: str, symbol: str) -> bool:
+    """Prevent Google News search from slipping in unrelated market headlines."""
+    for term in [symbol, *_rss_company_terms(symbol)]:
+        # Word/phrase boundaries are important for symbols such as ARM / META.
+        if re.search(r'(?<![A-Za-z0-9])' + re.escape(term) + r'(?![A-Za-z0-9])',
+                     title, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _fetch_stock_rss_items(symbol: str, days: int) -> List[dict]:
+    queries = _rss_queries(symbol)
+    # RSS requests are low-memory I/O; run them concurrently instead of serially.
+    with ThreadPoolExecutor(max_workers=min(3, len(queries))) as pool:
+        lists = list(pool.map(lambda q: _fetch_rss_headlines(q, days), queries))
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    # Google occasionally serves stale results, even with when:1d/7d.
+    # Allow a small cushion for timezone/feed indexing differences.
+    max_age = (days * 24 + 8) * 3600
+    seen = set()
+    articles = []
+    for results in lists:
+        for item in results:
+            title = item['title']
+            if not _rss_title_matches_company(title, symbol):
+                continue
+            published_ts = item.get('_published_ts') or 0.0
+            if published_ts and (now_ts - published_ts > max_age or published_ts > now_ts + 7200):
+                continue
+            key = re.sub(r'[^a-z0-9]+', '', title.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            articles.append(item)
+    articles.sort(key=lambda item: item.get('_published_ts') or 0.0, reverse=True)
+    return articles
 
 
 def format_news_context(items: List[dict]) -> str:
-    """Prompt-ready text for the LLM (this is what ends up in stock_data['news'])."""
+    """Prompt text in the original structure consumed by the existing script."""
     if not items:
-        return "No recent breaking news available."
+        return 'No recent company-specific news found. Do not invent a cause for today\'s move.'
     blocks = []
     for it in items:
-        text = f"• [{it['provider']}] {it['title']}"
-        if it["summary"]:
-            text += f"\n  Context: {it['summary']}"
-        blocks.append(text)
-    return "\n\n".join(blocks)
-
-
-def extract_news_context(news_data, max_articles: int = 3) -> str:
-    """Headlines + summaries from yfinance's news structure (kept for backwards compatibility)."""
-    items = extract_news_items(news_data, max_articles)
-    if not items and news_data and isinstance(news_data, list):
-        return "No breaking news found for this ticker today. "
-    return format_news_context(items)
+        published = it.get('published')
+        date_note = f', published {published[:10]} UTC' if published else ''
+        line = f"• [{it['provider']}{date_note}] {it['title']}"
+        if it.get('summary'):
+            line += f"\n  Context: {it['summary']}"
+        blocks.append(line)
+    return ('Company news headlines from Google News RSS (headlines are NOT proof '
+            'that an event caused today\'s stock move):\n' + '\n\n'.join(blocks))
 
 
 def fetch_news_context(symbol: str) -> Tuple[str, List[dict]]:
-    """Returns (prompt text, structured items). The items feed the on-screen news card."""
-    try:
-        items = extract_news_items(yf.Ticker(symbol).news)
-        return format_news_context(items), items
-    except Exception as e:
-        logger.warning(f"⚠️ Could not fetch news for {symbol}: {e}")
-        return "No recent breaking news available.", []
+    """Return the SAME (prompt text, card items) as before, now via Google RSS."""
+    symbol = symbol.strip().upper()
+    logger.info('📰 Fetching %s news via Google News RSS (past 24h)...', symbol)
+    fresh = _fetch_stock_rss_items(symbol, days=1)
+    if len(fresh) >= 3:
+        articles = fresh[:RSS_NEWS_MAX_ARTICLES]
+    else:
+        # Weekend / slow news cycle fallback; dated in the Gemini context.
+        logger.info('Only %s recent RSS headlines for %s, checking past 7 days.', len(fresh), symbol)
+        older = _fetch_stock_rss_items(symbol, days=7)
+        seen = {re.sub(r'[^a-z0-9]+', '', x['title'].casefold()) for x in fresh}
+        articles = list(fresh)
+        for item in older:
+            key = re.sub(r'[^a-z0-9]+', '', item['title'].casefold())
+            if key not in seen:
+                articles.append(item)
+                seen.add(key)
+            if len(articles) >= RSS_NEWS_MAX_ARTICLES:
+                break
+
+    # Drop private ranking metadata; the card needs provider/title/summary only.
+    items = [{k: v for k, v in item.items() if not k.startswith('_')}
+             for item in articles[:RSS_NEWS_MAX_ARTICLES]]
+    logger.info('✅ %s: received %d relevant RSS headlines.', symbol, len(items))
+    if items:
+        logger.info('Top RSS headline: %s (%s)', items[0]['title'], items[0]['provider'])
+    return format_news_context(items), items
 
 
 def get_company_name(symbol: str) -> str:
@@ -1430,3 +1559,4 @@ if __name__ == "__main__":
         Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
     else:
         create_stock_short(upload=False)
+
