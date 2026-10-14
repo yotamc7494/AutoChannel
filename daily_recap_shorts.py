@@ -64,9 +64,9 @@ BG_MUSIC_FADE_OUT = 2.0
 SHORTS_MAX_SECONDS = 59.0              # stock segments that would push the video past this are dropped
 
 # --- Parallelism ---
-IO_WORKERS = 2                       # threads for network calls
-PARALLEL_RENDER = True                 # render each scene in its own process
-MAX_RENDER_WORKERS = 2
+IO_WORKERS = 1                       # threads for network calls
+PARALLEL_RENDER = False                 # render each scene in its own process
+MAX_RENDER_WORKERS = 1
 
 
 # --- Data ---
@@ -342,7 +342,7 @@ def _process_series(df, target_len: int = 300) -> Tuple[np.ndarray, float]:
 def fetch_intro_index_data() -> dict:
     logger.info("📊 Fetching intraday index data...")
     symbols = {"SPY": "SPY", "QQQ": "QQQ", "BTC": "BTC-USD"}
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=1) as ex:
         watch_f = ex.submit(fetch_top_movers_and_watchlist)
         hist_f = {k: ex.submit(_fetch_intraday, s) for k, s in symbols.items()}
         hist = {k: f.result() for k, f in hist_f.items()}
@@ -415,7 +415,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 # 6. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
 
-
+@st.cache_resource
 def get_kokoro_pipeline():
     global _kokoro_pipeline
     if _kokoro_pipeline is None:

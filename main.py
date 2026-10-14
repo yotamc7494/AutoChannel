@@ -565,7 +565,7 @@ def fetch_market_metrics(symbol: str) -> Dict[str, Optional[str]]:
             logger.warning(f"⚠️ {what} unavailable: {e}")
             return None
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=1) as ex:
         cap_f = ex.submit(attempt, lambda: _fetch_market_cap(symbol), f"{symbol} market cap")
         sp_f = ex.submit(attempt, lambda: _fetch_last_price("^GSPC"), "S&P 500 price")
         btc_f = ex.submit(attempt, lambda: _fetch_last_price("BTC-USD"), "BTC price")
@@ -649,7 +649,7 @@ def generate_script_and_titles_with_ai(stock_data: dict) -> dict:
 # =====================================================================
 # 7. TEXT-TO-SPEECH (Kokoro-82M, local)
 # =====================================================================
-
+@st.cache_resource
 def get_kokoro_pipeline():
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
@@ -1237,7 +1237,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
     work_dir = Path(tempfile.mkdtemp(prefix="stock_short_"))
     try:
         # ---- Phase A: data + audio. Independent network calls overlap; Whisper loads in the background ----
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=1) as pool:
             whisper_future = pool.submit(get_whisper_model)
 
             stock_data = get_top_moving_stock(test=test)
