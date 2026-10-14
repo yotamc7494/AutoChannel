@@ -1059,7 +1059,7 @@ def approximate_word_timings(script_text: str, duration: float) -> List[dict]:
 
 def transcribe_words(audio_file: str, script_text: str = '', duration: float = 0.0) -> List[dict]:
     """Whisper in a lean process; optional low-RAM approximate timings mode."""
-    if os.getenv('STOCK_APPROX_TIMINGS', '0') == '1':
+    if os.getenv('STOCK_APPROX_TIMINGS', '1') == '1':
         logger.warning('Skipping Whisper by STOCK_APPROX_TIMINGS=1; captions are approximate.')
         return approximate_word_timings(script_text, duration)
     with tempfile.TemporaryDirectory(prefix='stock_whisper_job_') as td:
