@@ -15,7 +15,7 @@ except Exception:
 
 # ייבוא פונקציות קיימות
 from comparison_video_engine import run_generator
-from main import render_final_video, view_final_video
+from stock_recap_shorts import create_stock_short
 from streamlit.logger import get_logger
 from daily_recap_shorts import run_perfect_pipeline
 
@@ -35,7 +35,7 @@ if "WEBHOOK_TOKEN" in query_params:
         print(f"⚡ Webhook triggered: {video_type}", file=sys.stderr, flush=True)
 
         if video_type == "update_video":
-            filename = render_final_video()
+            filename = create_stock_short(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "vs_video":
@@ -283,11 +283,7 @@ if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
             video_path = None
 
             if video_type == "סרטון מנייה":
-                if is_test_mode:
-                    video_path = view_final_video()
-                else:
-                    render_final_video()
-                    video_path = "final_stock_video.mp4"  # נתב לפי הקובץ ש-render_final_video מייצרת
+                video_path = create_stock_short(upload=should_upload)
 
             elif video_type == "סרטון השוואה":
                 video_path = run_generator(is_test_mode)
