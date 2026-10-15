@@ -764,10 +764,41 @@ def fetch_chart_data(ticker: str, timeframe: str) -> Optional[dict]:
 # =====================================================================
 # 6. TEXT-TO-SPEECH (Kokoro-82M, local, isolated worker, one clip per segment)
 # =====================================================================
-def get_kokoro_pipeline():
-    """The heavyweight Kokoro / Torch imports only happen in the temporary TTS process."""
-    from kokoro import KPipeline
-    return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+import requests   # put with the other top-level imports
+
+KOKORO_DIR = Path(__file__).resolve().parent / "kokoro_assets"
+_KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+KOKORO_MODEL_NAME = "kokoro-v1.0.int8.onnx"   # ~90 MB. Use "kokoro-v1.0.onnx" (~310 MB) for best quality.
+KOKORO_VOICES_NAME = "voices-v1.0.bin"
+
+
+def _download(url: str, dest: Path) -> None:
+    logger.info("Downloading %s ...", dest.name)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, allow_redirects=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+    tmp.replace(dest)  # only becomes the real file once the download completed
+
+
+def _get_or_download_kokoro_assets() -> Tuple[str, str]:
+    KOKORO_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = KOKORO_DIR / KOKORO_MODEL_NAME
+    voices_path = KOKORO_DIR / KOKORO_VOICES_NAME
+    for path in (model_path, voices_path):
+        if not path.exists():
+            _download(f"{_KOKORO_BASE}/{path.name}", path)
+    return str(model_path), str(voices_path)
+
+
+@lru_cache(maxsize=1)
+def get_kokoro_onnx():
+    from kokoro_onnx import Kokoro  # lazy: render workers never load onnxruntime
+    model_path, voices_path = _get_or_download_kokoro_assets()
+    return Kokoro(model_path, voices_path)
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -780,42 +811,21 @@ def clean_script_for_tts(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
-def _generate_voiceovers_in_worker(items: List[Tuple[str, str]], speed: float) -> List[float]:
-    """Stream Kokoro output directly to WAV files; never concatenate all chunks in RAM."""
-    import soundfile as sf
-    import torch
-    torch.set_num_threads(2)
-    pipeline = get_kokoro_pipeline()
-    durations = []
-    logger.info("Generating %d Kokoro clips in isolated worker (speed %.2f)", len(items), speed)
-    for text, path in items:
-        logger.info("Kokoro audio: %s", Path(path).name)
-        count = 0
-        with sf.SoundFile(str(path), "w", samplerate=TTS_RATE, channels=1, format="WAV", subtype="PCM_16") as out:
-            for _, _, audio in pipeline(clean_script_for_tts(text), voice=TTS_VOICE, speed=speed,
-                                         split_pattern=r"\n+"):
-                if hasattr(audio, "detach"):
-                    audio = audio.detach().cpu().numpy()
-                samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-                if samples.size:
-                    out.write(samples)
-                    count += samples.size
-        if not count:
-            raise RuntimeError(f"Kokoro returned empty audio for {path}")
-        durations.append(count / TTS_RATE)
-        logger.info("Created %s (%.2fs)", Path(path).name, durations[-1])
-    del pipeline
-    return durations
-
-
 def generate_voiceovers(items: List[Tuple[str, str]], speed: float = TTS_SPEED) -> List[float]:
-    """The Torch/Kokoro RAM is released when the worker exits."""
-    with tempfile.TemporaryDirectory(prefix="myth_tts_") as td:
-        job_file, result_file = Path(td) / "job.json", Path(td) / "durations.json"
-        job_file.write_text(json.dumps({"speed": speed, "items": [(str(t), str(p)) for t, p in items]}),
-                            encoding="utf-8")
-        run_memory_worker("tts", str(job_file), str(result_file))
-        return json.loads(result_file.read_text(encoding="utf-8"))
+    """In-process ONNX TTS (no Torch, so no separate worker is needed)."""
+    import soundfile as sf
+    kokoro = get_kokoro_onnx()
+    durations = []
+    logger.info("Generating %d Kokoro clips via ONNX (speed %.2f)", len(items), speed)
+    for text, path in items:
+        samples, sample_rate = kokoro.create(clean_script_for_tts(text), voice=TTS_VOICE,
+                                             speed=speed, lang="en-us")
+        if len(samples) == 0:
+            raise RuntimeError(f"Kokoro returned empty audio for {path}")
+        sf.write(str(path), samples, sample_rate, subtype="PCM_16")
+        durations.append(len(samples) / sample_rate)
+        logger.info("Created %s (%.2fs)", Path(path).name, durations[-1])
+    return durations
 
 
 # =====================================================================
@@ -2106,8 +2116,6 @@ if __name__ == "__main__":
         if len(sys.argv) != 4:
             raise SystemExit("Usage: --tts-worker input.json durations.json")
         job_data = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-        result = _generate_voiceovers_in_worker(job_data["items"], float(job_data["speed"]))
-        Path(sys.argv[3]).write_text(json.dumps(result), encoding="utf-8")
     elif len(sys.argv) > 1 and sys.argv[1] == "--render-worker":
         if len(sys.argv) != 3:
             raise SystemExit("Usage: --render-worker job.pkl")

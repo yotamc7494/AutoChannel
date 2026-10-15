@@ -362,34 +362,8 @@ def ask_llm(prompt, config=None, parse: Optional[Callable] = None, max_rounds: i
 
 
 # =====================================================================
-# 4. STOCK SELECTION  (Redis "used today" + one batch download)
+# 4. STOCK SELECTION  (one batch download)
 # =====================================================================
-def _get_redis_client():
-    from upstash_redis import Redis
-    url, token = get_secret("UPSTASH_REDIS_REST_URL"), get_secret("UPSTASH_REDIS_REST_TOKEN")
-    if not url or not token:
-        raise ValueError("Missing Redis credentials! Check your .env file or Streamlit secrets.")
-    return Redis(url=url, token=token)
-
-
-def get_used_stocks_today() -> set:
-    try:
-        members = _get_redis_client().smembers(f"used_stocks:{date.today()}")
-        return set(members) if members else set()
-    except Exception as e:
-        logger.warning(f"Error fetching used stocks from Redis: {e}")
-        return set()
-
-
-def mark_stock_as_used(ticker_symbol: str) -> None:
-    try:
-        redis = _get_redis_client()
-        key = f"used_stocks:{date.today()}"
-        redis.sadd(key, ticker_symbol)
-        redis.expire(key, 172800)  # 48h
-        logger.info(f"Stock {ticker_symbol} marked as used for {date.today()}")
-    except Exception as e:
-        logger.warning(f"Error marking stock {ticker_symbol} as used in Redis: {e}")
 
 
 def _download_batch(tickers: List[str]):
@@ -434,13 +408,7 @@ def _session_stats(df) -> Optional[dict]:
 
 def get_top_moving_stock(test: bool = False) -> dict:
     """The ticker with the biggest move (in %) in the latest session, skipping ones already used today."""
-    used_today = get_used_stocks_today()
-    logger.info(f"Stocks already used today ({date.today()}): {sorted(used_today) or 'None'}")
-
-    candidates = [t for t in TICKERS_TO_CHECK if t not in used_today]
-    if not candidates:
-        logger.warning("All tickers were already used today; allowing repeats.")
-        candidates = list(TICKERS_TO_CHECK)
+    candidates = list(TICKERS_TO_CHECK)
 
     download_list = sorted(set(candidates) | set(MARKET_REFS))
     logger.info(f"Batch fetching {len(download_list)} tickers in one request...")
@@ -465,8 +433,6 @@ def get_top_moving_stock(test: bool = False) -> dict:
 
     best["market"] = {k: changes[k] for k in MARKET_REFS if k in changes}
     logger.info(f"Top Moving Stock: {best['symbol']} ({best['change_pct']}%)")
-    if not test:
-        mark_stock_as_used(best["symbol"])
     return best
 
 
@@ -909,6 +875,43 @@ def clean_ticker_text(text: str) -> str:
 # =====================================================================
 # 7. TEXT-TO-SPEECH  (Kokoro-82M, local, in-process, one clip per beat)
 # =====================================================================
+import requests   # put with the other top-level imports
+
+KOKORO_DIR = Path(__file__).resolve().parent / "kokoro_assets"
+_KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+KOKORO_MODEL_NAME = "kokoro-v1.0.int8.onnx"   # ~90 MB. Use "kokoro-v1.0.onnx" (~310 MB) for best quality.
+KOKORO_VOICES_NAME = "voices-v1.0.bin"
+
+
+def _download(url: str, dest: Path) -> None:
+    logger.info("Downloading %s ...", dest.name)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, allow_redirects=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+    tmp.replace(dest)  # only becomes the real file once the download completed
+
+
+def _get_or_download_kokoro_assets() -> Tuple[str, str]:
+    KOKORO_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = KOKORO_DIR / KOKORO_MODEL_NAME
+    voices_path = KOKORO_DIR / KOKORO_VOICES_NAME
+    for path in (model_path, voices_path):
+        if not path.exists():
+            _download(f"{_KOKORO_BASE}/{path.name}", path)
+    return str(model_path), str(voices_path)
+
+
+@lru_cache(maxsize=1)
+def get_kokoro_onnx():
+    from kokoro_onnx import Kokoro  # lazy: render workers never load onnxruntime
+    model_path, voices_path = _get_or_download_kokoro_assets()
+    return Kokoro(model_path, voices_path)
+
+
 def clean_script_for_tts(text: str) -> str:
     """Removes non-ASCII characters/emojis & converts symbols for clear TTS."""
     text = re.sub(r"[^\x00-\x7F]+", "", text)
@@ -924,34 +927,27 @@ def generate_voiceover(beat_texts: List[str], out_path: Path) -> Tuple[List[Tupl
     Returns ([(start, end) of each beat in seconds], end of the last word). Beat timings are exact,
     which is how the captions and the headline pop-ups stay in sync without Whisper."""
     import soundfile as sf
-    import torch
-    from kokoro import KPipeline
-
-    pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
-    gap = np.zeros(int(TTS_RATE * BEAT_GAP), dtype=np.float32)
+    kokoro = get_kokoro_onnx()
     pieces: List[np.ndarray] = []
     spans: List[Tuple[float, float]] = []
-    cursor = 0
-    with torch.inference_mode():
-        for i, text in enumerate(beat_texts):
-            chunks = []
-            for _, _, audio in pipeline(clean_script_for_tts(text), voice=TTS_VOICE, speed=TTS_SPEED,
-                                        split_pattern=r"\n+"):
-                if hasattr(audio, "detach"):
-                    audio = audio.detach().cpu().numpy()
-                chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
-            if not chunks:
-                raise RuntimeError(f"Kokoro returned empty audio for beat {i}: {text!r}")
-            clip = np.concatenate(chunks)
-            spans.append((cursor / TTS_RATE, (cursor + len(clip)) / TTS_RATE))
-            pieces.append(clip)
-            cursor += len(clip)
-            if i < len(beat_texts) - 1:
-                pieces.append(gap)
-                cursor += len(gap)
-    sf.write(str(out_path), np.concatenate(pieces), TTS_RATE, subtype="PCM_16")
-    del pipeline
-    gc.collect()
+    gap, sample_rate, cursor = None, TTS_RATE, 0
+    for i, text in enumerate(beat_texts):
+        clip, sample_rate = kokoro.create(clean_script_for_tts(text), voice=TTS_VOICE,
+                                          speed=TTS_SPEED, lang="en-us")
+        clip = np.asarray(clip, dtype=np.float32).reshape(-1)
+        if clip.size == 0:
+            raise RuntimeError(f"Kokoro returned empty audio for beat {i}: {text!r}")
+        if sample_rate != TTS_RATE:
+            logger.warning("Kokoro sample rate is %d, TTS_RATE is %d", sample_rate, TTS_RATE)
+        if gap is None:
+            gap = np.zeros(int(sample_rate * BEAT_GAP), dtype=np.float32)
+        spans.append((cursor / sample_rate, (cursor + len(clip)) / sample_rate))
+        pieces.append(clip)
+        cursor += len(clip)
+        if i < len(beat_texts) - 1:
+            pieces.append(gap)
+            cursor += len(gap)
+    sf.write(str(out_path), np.concatenate(pieces), sample_rate, subtype="PCM_16")
     logger.info("Voiceover: %d beats, %.1fs", len(spans), spans[-1][1])
     return spans, spans[-1][1]
 
