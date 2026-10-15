@@ -663,19 +663,24 @@ def generate_myth_script() -> MythBusterScript:
     prompt = f"""
     You are the DIRECTOR of a viral YouTube Shorts channel called "Financial MythBusters".
     Invent ONE evergreen financial myth to bust, then direct the whole vertical video: the spoken script,
-    the visual layout of every segment and the on-screen popups. The video must stay under 60 seconds.
+    the visual layout of every segment and the on-screen popups. The video must stay under 50 seconds.
 
     TOPIC
     - A widespread, genuinely wrong or misleading belief about money or investing that you can debunk with
       CORRECT, conservative facts. Evergreen only: no dates, no "today", no news, no live prices.
-    - Inspiration (pick one, or something equally viral): {areas}
+    - Inspiration (pick one, or something equally viral): 
+    {areas}
 
-    STRUCTURE
-    - {SEG_MIN} or {SEG_MAX} segments played in order. All "script" fields together: {SCRIPT_WORDS_MIN + 5} to {SCRIPT_WORDS_MAX - 5} words
-      (every segment 1 to 3 SHORT sentences).
-    - Segment 1 is a scroll-stopping hook that states the myth boldly start with the misconception. The last segment is a punchy takeaway
-      and a call to action (comment your thoughts / follow for more myth busting).
-    - the structure of the information you give the viewers is supposed to keep them in the video, talk about the myth even ask it as a question if it fits then start with the explenation and at the end say the result of why the myth is wrong
+    NARRATIVE ARC (THE "VERITASIUM" STRUCTURE)
+    To maximize viewer retention, you must delay the final answer. Follow this exact flow across your {SEG_MIN} to {SEG_MAX} segments:
+    - THE HOOK (Segment 1): Start with a scroll-stopping question that states the misconception. Make the viewer wonder if the myth might actually be true. DO NOT debunk it yet.
+    - THE SETUP (Segment 2): Explain the intuition behind the myth. Why do so many people believe this? (Build the mystery).
+    - THE EXPLANATION (Middle Segments): Break down the actual mechanics, math, or hidden reality. 
+    - THE VERDICT & CTA (Last Segment): Give the conclusive, finalizing argument of why the myth is wrong based on your explanation. End with a punchy call to action (e.g., comment your thoughts / subscribe for more).
+
+    SCRIPT FORMAT
+    - All "script" fields combined must be exactly {SCRIPT_WORDS_MIN + 5} to {SCRIPT_WORDS_MAX - 5} words.
+    - Keep every segment to 1 to 3 SHORT, punchy sentences.
     - Use at least 3 DIFFERENT layouts, never the same layout twice in a row, "annotated_chart" at most once.
     - Fill ONLY the fields of the chosen layout; leave the others empty / default.
 
@@ -712,9 +717,9 @@ def generate_myth_script() -> MythBusterScript:
       metric values. "headline" is UPPERCASE, max 22 characters.
 
     TICKER AND SEO
-    - "news_ticker_text": 3 or 4 UPPERCASE items 'TOPIC: ultra short summary', separated by '  \u2022  ',
-      evergreen myth-busting style, e.g. "MYTH ALERT: HIGH YIELD IS NOT FREE MONEY  \u2022  FACTS OVER HYPE".
-    - "youtube_title": max 70 characters, contains the myth keywords (emojis allowed here only) Talk to the audiance using the misconception by telling them they are wrong in the title.
+    - "news_ticker_text": 3 or 4 UPPERCASE items 'TOPIC: ultra short summary', separated by ' \u2022 ',
+      evergreen myth-busting style, e.g. "MYTH ALERT: HIGH YIELD IS NOT FREE MONEY \u2022 FACTS OVER HYPE".
+    - "youtube_title": max 70 characters. Talk directly to the audience, using the misconception to tell them they are wrong (e.g., "Why You're WRONG About [Topic]"). Emojis allowed here only.
     - "description": 2 sentences with key financial terms, a call to action, and the line "Not financial advice."
     - "tags": 5 to 8 comma separated tags.
 
