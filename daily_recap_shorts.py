@@ -361,6 +361,8 @@ def extract_and_verify_ticker_data(market_summary: str) -> dict:
         tickers = {str(t).strip().lstrip("$").upper() for t in raw if str(t).strip()}
     except Exception:
         tickers = {"NVDA", "TSLA", "AAPL", "MSFT"}
+    ALIASES = {"TSMC": "TSM", "GOOG": "GOOGL", "BITCOIN": "BTC-USD", "BTC": "BTC-USD"}
+    tickers = {ALIASES.get(t, t) for t in tickers}
 
     rows = parallel_map(lambda t: _fetch_close_change(t, "5d"), sorted(tickers))
     return {
@@ -481,13 +483,37 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
 
 
 # =====================================================================
-# 6. TEXT-TO-SPEECH (Kokoro-82M, local)
+# 6. TEXT-TO-SPEECH (Kokoro-ONNX, direct download, no PyTorch)
 # =====================================================================
+import requests
 
-def get_kokoro_pipeline():
-    """The heavyweight Kokoro / Torch imports only happen in the temporary TTS process."""
-    from kokoro import KPipeline
-    return KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+KOKORO_DIR = Path(__file__).resolve().parent / "kokoro_assets"
+_KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+KOKORO_MODEL_NAME = "kokoro-v1.0.int8.onnx"   # ~90 MB, much lighter on RAM. Use "kokoro-v1.0.onnx" (~310 MB) for best quality.
+KOKORO_VOICES_NAME = "voices-v1.0.bin"
+
+
+def _download(url: str, dest: Path) -> None:
+    logger.info("⬇️ Downloading %s ...", dest.name)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, allow_redirects=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    f.write(chunk)
+    tmp.replace(dest)  # only becomes the real file if the download completed
+    logger.info("✅ Downloaded %s", dest.name)
+
+
+def _get_or_download_kokoro_assets() -> Tuple[str, str]:
+    KOKORO_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = KOKORO_DIR / KOKORO_MODEL_NAME
+    voices_path = KOKORO_DIR / KOKORO_VOICES_NAME
+    for path, name in ((model_path, KOKORO_MODEL_NAME), (voices_path, KOKORO_VOICES_NAME)):
+        if not path.exists():
+            _download(f"{_KOKORO_BASE}/{name}", path)
+    return str(model_path), str(voices_path)
 
 
 def clean_script_for_tts(text: str) -> str:
@@ -499,42 +525,27 @@ def clean_script_for_tts(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
-def _generate_voiceovers_in_worker(items: List[Tuple[str, str]]) -> List[float]:
-    """Stream Kokoro output directly to WAV files; never concatenate all chunks in RAM."""
-    import soundfile as sf
-    import torch
-    torch.set_num_threads(2)
-    pipeline = get_kokoro_pipeline()
-    durations = []
-    logger.info("Generating %d Kokoro clips in isolated worker", len(items))
-    for text, path in items:
-        logger.info("Kokoro audio: %s", Path(path).name)
-        count = 0
-        with sf.SoundFile(str(path), "w", samplerate=24000, channels=1,
-                          format="WAV", subtype="PCM_16") as out:
-            for _, _, audio in pipeline(clean_script_for_tts(text), voice="am_liam", speed=1.1,
-                                         split_pattern=r"\n+"):
-                if hasattr(audio, "detach"):
-                    audio = audio.detach().cpu().numpy()
-                samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-                if samples.size:
-                    out.write(samples)
-                    count += samples.size
-        if not count:
-            raise RuntimeError(f"Kokoro returned empty audio for {path}")
-        durations.append(count / 24000)
-        logger.info("Created %s (%.2fs)", Path(path).name, durations[-1])
-    del pipeline
-    return durations
+@lru_cache(maxsize=1)
+def get_kokoro_onnx():
+    from kokoro_onnx import Kokoro  # lazy import
+    model_path, voices_path = _get_or_download_kokoro_assets()
+    return Kokoro(model_path, voices_path)
 
 
 def generate_voiceovers(items: List[Tuple[str, str]]) -> List[float]:
-    """Same public API; the Torch/Kokoro RAM is released when the worker exits."""
-    with tempfile.TemporaryDirectory(prefix="perfect_tts_") as td:
-        job_file, result_file = Path(td) / "job.json", Path(td) / "durations.json"
-        job_file.write_text(json.dumps([(str(t), str(p)) for t, p in items]), encoding="utf-8")
-        run_memory_worker("tts", str(job_file), str(result_file))
-        return json.loads(result_file.read_text(encoding="utf-8"))
+    """In-process ONNX TTS (no Torch, so no separate worker is needed)."""
+    import soundfile as sf
+    kokoro = get_kokoro_onnx()
+    durations = []
+    for text, path in items:
+        samples, sample_rate = kokoro.create(
+            clean_script_for_tts(text), voice="am_liam", speed=1.1, lang="en-us")
+        if len(samples) == 0:
+            raise RuntimeError(f"Kokoro returned empty audio for {path}")
+        sf.write(str(path), samples, sample_rate)
+        durations.append(len(samples) / sample_rate)
+        logger.info("Created %s (%.2fs)", Path(path).name, durations[-1])
+    return durations
 
 
 # =====================================================================
@@ -1252,16 +1263,9 @@ def run_perfect_pipeline(
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--tts-worker":
-        if len(sys.argv) != 4:
-            raise SystemExit("Usage: --tts-worker input.json durations.json")
-        items = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-        durations = _generate_voiceovers_in_worker(items)
-        Path(sys.argv[3]).write_text(json.dumps(durations), encoding="utf-8")
-    elif len(sys.argv) > 1 and sys.argv[1] == "--render-worker":
+    if len(sys.argv) > 1 and sys.argv[1] == "--render-worker":
         if len(sys.argv) != 3:
             raise SystemExit("Usage: --render-worker job.pkl")
-        # This pickle file is written by this application into its private temp dir.
         with open(sys.argv[2], "rb") as f:
             job = pickle.load(f)
         render_scene_job(job)
