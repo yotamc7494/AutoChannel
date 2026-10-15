@@ -2,15 +2,11 @@ import os
 import urllib.request
 from io import BytesIO
 from PIL import Image
-
-# במידה ויש לך קובץ main.py עם TICKERS_TO_CHECK, הוא ייבא ממנו. אחרת ישתמש ברשימת ברירת מחדל.
-try:
-    from main import TICKERS_TO_CHECK
-except ImportError:
-    TICKERS_TO_CHECK = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META",
-        "AMD", "INTC", "NFLX", "DIS", "PYPL", "BAC", "JPM", "V"
-    ]
+TICKERS_TO_CHECK = [
+    "NVDA", "AVGO", "AAPL", "TSLA", "MSFT", "AMZN", "GOOGL", "META",
+    "AMD", "PLTR", "SMCI", "ARM", "NFLX", "COIN", "MSTR", "INTC",
+    "BRK-B", "JPM", "LLY", "QQQ", "SPY",
+]
 
 LOGOS_DIR = "assets/logos"
 
