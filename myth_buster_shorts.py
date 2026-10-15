@@ -675,7 +675,7 @@ def generate_myth_script() -> MythBusterScript:
       (every segment 1 to 3 SHORT sentences).
     - Segment 1 is a scroll-stopping hook that states the myth boldly start with the misconception. The last segment is a punchy takeaway
       and a call to action (comment your thoughts / follow for more myth busting).
-    - the structure of the information you gove the viewers is supposed to keep them in the video, talk about the myth then start with the explenation and at the end say the result of why the myth is wrong
+    - the structure of the information you give the viewers is supposed to keep them in the video, talk about the myth even ask it as a question if it fits then start with the explenation and at the end say the result of why the myth is wrong
     - Use at least 3 DIFFERENT layouts, never the same layout twice in a row, "annotated_chart" at most once.
     - Fill ONLY the fields of the chosen layout; leave the others empty / default.
 
