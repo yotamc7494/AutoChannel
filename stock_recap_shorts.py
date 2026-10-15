@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import gc
 import html
-import json
 import logging
 import math
 import os
@@ -89,7 +88,6 @@ OUTPUT_FPS = 30
 RENDER_FPS = 15                      # matplotlib layer is redrawn at this rate, frames are repeated
 VIDEO_BITRATE = "4500k" if VIDEO_W <= 720 else "8000k"
 X264_PRESET = "ultrafast"
-BG_MUSIC_PATH = "assets/weekly_recup_music.mp3"
 BG_MUSIC_VOLUME = 0.12
 BG_MUSIC_FADE_OUT = 2.0
 SHORTS_MAX_SECONDS = 59.0
@@ -1495,12 +1493,12 @@ class StockShortScene:
 # =====================================================================
 # 10. VIDEO RENDER  (frames piped straight to ffmpeg, voice + music mixed in the same pass)
 # =====================================================================
-def render_video(scene: StockShortScene, voice_path: str, total: float, out_path: str,
-                 music_path: Optional[str] = BG_MUSIC_PATH) -> None:
+def render_video(scene: StockShortScene, voice_path: str, total: float, out_path: str) -> None:
     n_frames = max(1, round(total * OUTPUT_FPS))
     cmd = [ffmpeg_exe(), "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{VIDEO_W}x{VIDEO_H}", "-r", str(OUTPUT_FPS), "-i", "-",
            "-i", str(voice_path)]
+    music_path = f"assets/music/{random.choice([1,2,3,4,5,6])}.mp3"
     have_music = bool(music_path) and os.path.exists(music_path)
     if have_music:
         logger.info("Mixing background music...")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+import random
 import asyncio
 import gc
 import concurrent.futures
@@ -1157,13 +1159,12 @@ def assemble_final_video(scene_paths: List[str], voice_tracks: List[Tuple[str, f
 # =====================================================================
 def run_perfect_pipeline(
         output_filename: str = "perfect_daily_recap_shorts.mp4",
-        bg_music_path: Optional[str] = "assets/weekly_recup_music.mp3",
         upload: bool = False,
 ) -> str:
     logger.info("🚀 Launching Daily Shorts Pipeline (low-memory Streamlit mode)...")
     log_memory("pipeline start")
     work_dir = Path(tempfile.mkdtemp(prefix="daily_shorts_"))
-
+    bg_music_path = f"assets/music/{random.choice([1,2,3,4,5,6])}.mp3"
     try:
         # ---- Phase A: all network work, as concurrent as the dependencies allow ----
         with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:

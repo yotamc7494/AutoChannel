@@ -14,7 +14,7 @@ except Exception:
     pass
 
 # ייבוא פונקציות קיימות
-from comparison_video_engine import run_generator
+from myth_buster_shorts import run_myth_buster_pipeline
 from stock_recap_shorts import create_stock_short
 from streamlit.logger import get_logger
 from daily_recap_shorts import run_perfect_pipeline
@@ -39,7 +39,7 @@ if "WEBHOOK_TOKEN" in query_params:
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "vs_video":
-            filename = run_generator()
+            filename = run_myth_buster_pipeline(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "daily_summery":
@@ -215,7 +215,7 @@ video_type = st.selectbox(
     "🎬 בחר סוג סרטון:",
     [
         "סרטון מנייה",
-        "סרטון השוואה",
+        "סרטון מיתוסים",
         "סיכום יומי (משודרג)"
     ]
 )
@@ -280,13 +280,14 @@ if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
 
     with st.spinner(f"⏳ מפיק סרטון {video_type}..."):
         try:
-            video_path = None
+            video_path = ""
 
             if video_type == "סרטון מנייה":
                 video_path = create_stock_short(upload=should_upload)
 
-            elif video_type == "סרטון השוואה":
-                video_path = run_generator(is_test_mode)
+            elif video_type == "סרטון מיתוסים":
+                output_file = "myth_buster_short.mp4"
+                video_path = run_myth_buster_pipeline(output_filename=output_file, upload=should_upload)
 
             elif video_type == "סיכום יומי (משודרג)":
                 output_file = "perfect_daily_recap.mp4"
