@@ -673,8 +673,9 @@ def generate_myth_script() -> MythBusterScript:
     STRUCTURE
     - {SEG_MIN} or {SEG_MAX} segments played in order. All "script" fields together: {SCRIPT_WORDS_MIN + 5} to {SCRIPT_WORDS_MAX - 5} words
       (every segment 1 to 3 SHORT sentences).
-    - Segment 1 is a scroll-stopping hook that states the myth boldly. The last segment is a punchy takeaway
+    - Segment 1 is a scroll-stopping hook that states the myth boldly start with the misconception. The last segment is a punchy takeaway
       and a call to action (comment your thoughts / follow for more myth busting).
+    - the structure of the information you gove the viewers is supposed to keep them in the video, talk about the myth then start with the explenation and at the end say the result of why the myth is wrong
     - Use at least 3 DIFFERENT layouts, never the same layout twice in a row, "annotated_chart" at most once.
     - Fill ONLY the fields of the chosen layout; leave the others empty / default.
 
@@ -713,7 +714,7 @@ def generate_myth_script() -> MythBusterScript:
     TICKER AND SEO
     - "news_ticker_text": 3 or 4 UPPERCASE items 'TOPIC: ultra short summary', separated by '  \u2022  ',
       evergreen myth-busting style, e.g. "MYTH ALERT: HIGH YIELD IS NOT FREE MONEY  \u2022  FACTS OVER HYPE".
-    - "youtube_title": max 70 characters, contains the myth keywords (emojis allowed here only).
+    - "youtube_title": max 70 characters, contains the myth keywords (emojis allowed here only) Talk to the audiance using the misconception by telling them they are wrong in the title.
     - "description": 2 sentences with key financial terms, a call to action, and the line "Not financial advice."
     - "tags": 5 to 8 comma separated tags.
 
