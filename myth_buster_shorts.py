@@ -87,7 +87,7 @@ POPUP_SECONDS = 2.8
 POPUP_MIN_SECONDS = 1.2
 POPUP_IN = 0.28
 POPUP_OUT = 0.22
-MAX_POPUPS_PER_SEGMENT = 3
+MAX_POPUPS_PER_SEGMENT = 1
 POPUP_POSITIONS = ("top", "center", "bottom", "left", "right")
 
 from myth_topics import TOPIC_AREAS
@@ -189,7 +189,7 @@ class Segment(BaseModel):
     headline: str = Field(description="Short on-screen title for this segment, UPPERCASE, max 22 characters")
     script: str = Field(description="Spoken narration for this segment: 1 to 3 short sentences")
     accent: str = Field(default="gold", description="Accent colour: red, green, gold, cyan, amber, white or purple")
-    popups: List[PopupSpec] = Field(default_factory=list, description="0 to 3 popups for this segment")
+    popups: List[PopupSpec] = Field(default_factory=list, description="1 popups for this segment")
 
     # --- myth_vs_reality ---
     myth_text: str = Field(default="", description="What people think (max 14 words)")
@@ -663,7 +663,7 @@ def generate_myth_script() -> MythBusterScript:
     prompt = f"""
     You are the DIRECTOR of a viral YouTube Shorts channel called "Financial MythBusters".
     Invent ONE evergreen financial myth to bust, then direct the whole vertical video: the spoken script,
-    the visual layout of every segment and the on-screen popups. The video must stay under 50 seconds.
+    the visual layout of every segment and the on-screen popup. The video must stay under 50 seconds.
 
     TOPIC
     - A widespread, genuinely wrong or misleading belief about money or investing that you can debunk with
@@ -701,7 +701,7 @@ def generate_myth_script() -> MythBusterScript:
        metric_result_value, metric_verdict (max 12 words). The result MUST follow from the parts.
     6. plain_text: a strong centred statement. plain_text (max 22 words) and plain_highlight (up to 3 words from it).
 
-    POPUPS (per segment, 0 to 3)
+    POPUPS (Only One)
     - title (max 3 words), value (max 10 characters, the punchy number or word being said at that moment),
       color (red, green, gold, cyan, amber, white or purple), position (top, center, bottom, left or right),
       trigger (0.0 to 1.0 = when inside THAT segment it appears; spread them between 0.15 and 0.85).
