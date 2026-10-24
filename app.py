@@ -38,7 +38,7 @@ if "WEBHOOK_TOKEN" in query_params:
             filename = create_stock_short(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
-        elif video_type == "vs_video":
+        elif video_type == "myth_buster":
             filename = run_myth_buster_pipeline(upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
