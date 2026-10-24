@@ -1607,7 +1607,7 @@ def create_stock_short(upload: bool = False, test: bool = False,
             if "#shorts" not in description.lower():
                 description += "\n\n#Shorts"
             tags = [t.strip() for t in script.tags.split(",") if t.strip()]
-            upload_video(file_path=output_filename, title=script.youtube_title, description=description, tags=tags)
+            upload_video(file_path=output_filename, title=script.youtube_title, description=description, tags=tags, category_id="25")
             logger.info(f"Uploaded To YouTube: {script.youtube_title}")
         return output_filename
     finally:

@@ -1251,6 +1251,7 @@ def run_perfect_pipeline(
                 title=script.youtube_title,
                 description=final_description,
                 tags=script.tags,
+                category_id="25",
             )
 
         log_memory("pipeline finished")

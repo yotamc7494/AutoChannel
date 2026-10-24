@@ -2108,7 +2108,7 @@ def run_myth_buster_pipeline(
         if upload:
             from uploader import upload_video  # import only when an upload is requested
             logger.info("Uploading Short to YouTube...")
-            upload_video(file_path=output_filename, title=youtube_title, description=description, tags=tags)
+            upload_video(file_path=output_filename, title=youtube_title, description=description, tags=tags, category_id="27")
             logger.info(f"Uploaded To YouTube: {youtube_title}")
         log_memory("pipeline finished")
         return output_filename
