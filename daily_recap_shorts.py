@@ -139,9 +139,10 @@ class StockAnalysis(BaseModel):
     ticker: str = Field(description="Stock ticker symbol, e.g. NVDA")
     company_spoken_name: str = Field(description="Full spoken company name for TTS, e.g. Nvidia")
     script: str = Field(description=(
-        "Spoken narrative for TTS: ONE or TWO short sentences With the Company name inside (max 25 words total) that explain ONLY the reason "
-        "behind the stock's move today (for example why it dropped). No prices, no price levels, no percentages, "
-        "no numbers."))
+        "Spoken narrative for TTS: ONE or TWO fast-paced sentences (max 20 words total). "
+        "MUST explicitly include the 'company_spoken_name'. Never say 'The company'. "
+        "Explain ONLY the reason behind the stock's move today. No prices, no price levels, no percentages, no numbers."
+    ))
     timeframe: str = Field(description="Chart timeframe: '1d', '1mo', '3mo', '6mo', or '1y'")
     interval: str = Field(description="Chart interval: '5m' for 1d, '1d' for others")
     key_levels: List[float] = Field(default=[], description="Important price levels to highlight on chart (shown visually only, never spoken)")
@@ -149,8 +150,8 @@ class StockAnalysis(BaseModel):
 
 
 class FullVideoScriptSchema(BaseModel):
-    intro_script: str = Field(description="STRICTLY 20 to 30 words English intro script Designed to Hok Viewers")
-    news_ticker_text: str = Field(description="Single line ticker with top 3-5 market headlines + short 4-word summary each, separated by '  •  ' e.g. 'FED CUTS RATES: Policy shifted dovish  •  NVDA SURGES: AI chip demand peaks  •  BTC BREAKS $70K: Institutional inflow high'")
+    intro_script: str = Field(description="STRICTLY 10 to 15 words. A fast, punchy English hook stating the market direction. No filler words, no 'watch till the end', no CTA.")
+    news_ticker_text: str = Field(description="Single line ticker with top 3-5 market headlines + short 4-word summary each, separated by '  •  ' e.g. 'FED CUTS RATES: Policy shifted dovish  •  NVDA SURGES: AI chip demand peaks'")
     analyzed_stocks: List[StockAnalysis]
     youtube_title: str
     description: str
@@ -456,7 +457,7 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     logger.info("Generating structured Shorts script with News Ticker from web insights...")
     prompt = f"""
     You are a top-tier Wall Street video producer and YouTube Shorts retention strategist.
-    Synthesize this web market summary and VERIFIED market data into an English script for a vertical
+    Synthesize this web market summary and VERIFIED market data into an English script for a fast-paced vertical
     YouTube Short that must stay under 60 seconds in total.
 
     Web Market Summary:
@@ -466,13 +467,19 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
     {json.dumps(verified_market_data, indent=2)}
 
     RULES:
-    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK, 20 to 30 words, with a call to action.
+    1. "intro_script": ULTRA-SHORT SCROLL-STOPPING HOOK, strictly 10 to 15 words. State the overall market vibe immediately. 
+       ABSOLUTELY NO CALL TO ACTION here. NO cliches like "Watch till the end" or "Let's break it down." 
+       Example: "Markets are bleeding today as AI fears drag tech stocks down."
+
     2. "news_ticker_text": Generate 3 high-impact breaking news headlines with ultra-short descriptions, separated by ' • '. Keep text uppercase and ultra punchy for top scrolling ticker.
-    3. "analyzed_stocks": Max 6 key stocks. Fill key_levels with precise chart levels (they are only drawn on the chart), on the last stock make a CTA in the end of the script
-    4. For every stock, "script" is ONE or TWO short sentences (max 25 words total) explaining ONLY the reason
-       behind the stock's move today, for example why it dropped, using the headlines above.
-       Do NOT mention prices, price levels, percentages or any numbers in it.
-    5. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field.
+
+    3. "analyzed_stocks": Max 6 key stocks. Fill key_levels with precise chart levels (they are only drawn on the chart). The LAST stock must include a CTA at the very end of its script asking for viewers' opinions.
+
+    4. "script" (for each stock): ONE or TWO short, punchy sentences (max 20 words total). 
+       CRITICAL: You MUST use the company's explicit name (e.g., "Nvidia" or "Apple"). NEVER use generic pronouns like "The company" or "The chip giant". 
+       Explain ONLY the fundamental reason behind the stock's move today. Do NOT mention prices, price levels, percentages, or any numbers.
+
+    5. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field. Write for natural Text-To-Speech reading.
     """
     from google.genai import types
     response = ask_llm(prompt, config=types.GenerateContentConfig(

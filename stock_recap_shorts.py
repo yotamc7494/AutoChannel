@@ -833,12 +833,9 @@ def generate_script_and_titles_with_ai(stock: dict, stats: dict, news_text: str,
         {news_text}
 
         RULES:
-        1. "beats": exactly 5 beats, in this order, each 1 or 2 SHORT sentences. All beats together: 75 to 90 words.
-           - hook: the FIRST sentence says WHAT the stock did and WHY, using the company's plain name (not the ticker).
-             Real substance, no vague teasers like "you won't believe this". About 15 words.
-           - catalyst: the real reason, grounded in the headlines above. NEVER invent a catalyst. If no headline clearly
-             explains the move, say honestly that no single headline explains it yet and name the most relevant
-             market-wide factor instead. Set "headline_index" to the headline that supports this beat, else -1.
+        "beats": exactly 5 beats, in this order, each 1 or 2 SHORT sentences. All beats together: 75 to 90 words.
+            - hook: A punchy, fast-paced opening sentence (under 10 words) that creates a CURIOSITY GAP. State WHAT the stock did (the move and direction) using the company's plain name, but DO NOT say WHY yet. Make them want to stay to find out. Example: "Here is exactly why [Company] just exploded X% today."
+            - catalyst: NOW explain the real reason (the WHY), grounded in the headlines above. NEVER invent a catalyst. If no headline clearly explains the move, say honestly that no single headline explains it yet and name the most relevant market-wide factor instead. Set "headline_index" to the headline that supports this beat, else -1.
         - context: one or two facts from the VERIFIED STATS that make the move meaningful (volume, how it compares with
              the S&P 500, where it sits versus its 52 week range, valuation, market cap). Set "headline_index" to a SECOND
              headline only if it adds a different fact, otherwise -1.
