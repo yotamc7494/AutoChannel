@@ -18,6 +18,7 @@ from myth_buster_shorts import run_myth_buster_pipeline
 from stock_recap_shorts import create_stock_short
 from streamlit.logger import get_logger
 from daily_recap_shorts import run_perfect_pipeline
+from weekly_recap import run_weekly_recap_pipeline
 
 logger = get_logger(__name__)
 
@@ -45,6 +46,11 @@ if "WEBHOOK_TOKEN" in query_params:
         elif video_type == "daily_summery":
             filename = "perfect_daily_recap.mp4"
             run_perfect_pipeline(output_filename=filename, upload=True)
+            st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            st.stop()
+        elif video_type == "weekly_summery":
+            filename = "weekly_recap.mp4"
+            run_weekly_recap_pipeline(output_filename=filename, upload=True)
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "ping":
@@ -216,7 +222,8 @@ video_type = st.selectbox(
     [
         "סרטון מנייה",
         "סרטון מיתוסים",
-        "סיכום יומי (משודרג)"
+        "סיכום יומי (משודרג)",
+        "סיכום שבועי"
     ]
 )
 
@@ -294,6 +301,10 @@ if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
                 run_perfect_pipeline(output_filename=output_file, upload=should_upload)
                 video_path = output_file
 
+            elif video_type == "סיכום שבועי":
+                output_file = "weekly_recap.mp4"
+                run_weekly_recap_pipeline(output_filename=output_file, upload=should_upload)
+                video_path = output_file
             st.success(f"🎉 סרטון {video_type} נוצר בהצלחה!")
 
             # הצגה והורדה
