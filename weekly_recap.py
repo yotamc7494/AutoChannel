@@ -11,15 +11,20 @@
           D. Render: one isolated OS process per chapter (several in parallel); every scene is an MP4 chunk that already
              contains its audio (TTS + SFX at t=0).
           E. Assemble: ffmpeg concat demuxer (stream copy) + optional ducked background music.
+          F. Thumbnail: the Director's ThumbnailSpec (in the outline) is drawn with Pillow (1280x720) once the video exists
+             and handed to the uploader as thumbnail_path=.
 
         Usage
           python weekly_recap.py [--upload] [--output out.mp4] [--news-file notes.txt] [--work-dir DIR]
                                  [--save-script s.json] [--load-script s.json] [--no-music]
         Env
           GEMINI_API_KEY, PERFECT_VIDEO_WIDTH=960|1280|1920 (default 1280), RECAP_RENDER_WORKERS, RECAP_RENDER_FPS
+          LOGO_DEV_TOKEN (optional: free Logo.dev publishable key, extra online source for thumbnail logos)
         Optional assets (never fatal if missing)
           assets/avatar/open.png, assets/avatar/closed.png, assets/music/*.mp3, assets/sfx/<name>.wav|mp3,
           assets/logos/<TICKER>.png (company logos are also downloaded on a best-effort basis)
+          assets/avatar/thumb_<shocked|pointing|thinking|neutral>.png (transparent cut-outs for the thumbnail; a drawn
+          placeholder is used when missing), assets/fonts/Anton-Regular.ttf (thumbnail font if Impact is not installed)
         """
 from __future__ import annotations
 
@@ -39,6 +44,7 @@ import sys
 import tempfile
 import time
 import wave
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -47,8 +53,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from pydantic import BaseModel, ConfigDict, Field
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 try:
     from dotenv import load_dotenv
@@ -199,6 +205,17 @@ PANEL_FACE = (22 / 255, 27 / 255, 34 / 255, 0.90)
 AVATAR_OPEN_PATH = "assets/avatar/open.png"
 AVATAR_CLOSED_PATH = "assets/avatar/closed.png"
 LOGO_DIR = Path("assets/logos")
+
+# --- YouTube thumbnail (16:9) ---
+THUMB_W, THUMB_H = 1280, 720
+THUMB_MAX_BYTES = 2_000_000  # YouTube rejects thumbnails over 2 MB
+THUMB_TEXT_MAX_CHARS = 26  # 3 words max AND this many characters, so the headline stays huge
+THUMB_AVATAR_PATHS = {  # transparent PNG cut-outs, ideally ~1000 px tall; a drawn placeholder is used if missing
+    "shocked": "assets/avatar/shocked.png",
+    "pointing": "assets/avatar/pointing.png",
+    "thinking": "assets/avatar/thinking.png",
+    "neutral": "assets/avatar/neutral.png",
+}
 
 
 def px(v: float) -> int:
@@ -389,6 +406,49 @@ class ChapterPlan(_Model):
     target_words: Optional[int] = Field(default=None, description="Legacy JSON compatibility only; ignored")
 
 
+class ThumbnailTemplate(str, Enum):
+    divergence = "divergence"
+    chart_alert = "chart_alert"
+    vs_showdown = "vs_showdown"
+    warning_sign = "warning_sign"
+    magnifying_glass = "magnifying_glass"
+    massive_number = "massive_number"
+
+
+class ThumbnailTrend(str, Enum):
+    bullish = "bullish"  # green
+    bearish = "bearish"  # red
+    neutral = "neutral"  # gold
+
+
+class AvatarEmotion(str, Enum):
+    shocked = "shocked"
+    pointing = "pointing"
+    thinking = "thinking"
+    neutral = "neutral"
+
+
+class ThumbnailSpec(_Model):
+    """The Director's YouTube thumbnail design; drawn by ThumbnailEngine after the video is assembled."""
+    template: ThumbnailTemplate = Field(description=(
+        "divergence = two tickers moving in OPPOSITE directions; vs_showdown = two tickers head to head; "
+        "chart_alert = ONE ticker's chart move is the story; warning_sign = a risk / crash / be-careful story; "
+        "magnifying_glass = 'look closer' at ONE ticker; massive_number = one shocking word or number is the story"))
+    main_text: str = Field(description=(
+        "MAX 3 WORDS, UPPERCASE, ultra-punchy, e.g. 'TECH CRASH?' or 'BUY NOW?'. No [[placeholders]]; "
+        "use a number only if it appears in the supplied data"))
+    primary_ticker: str = Field(default="", description="Most important real ticker for the thumbnail, or empty string")
+    secondary_ticker: str = Field(default="", description=(
+        "A second real ticker (REQUIRED by divergence and vs_showdown), or empty string"))
+    trend: ThumbnailTrend = Field(description="bullish = green, bearish = red, neutral = gold: the mood it promises")
+    avatar_emotion: AvatarEmotion = Field(description="shocked, pointing, thinking or neutral")
+
+
+# Used when an outline has no thumbnail (scripts saved before this feature existed, or an LLM that skipped it).
+THUMBNAIL_FALLBACK = {"template": "massive_number", "main_text": "WEEK IN REVIEW", "primary_ticker": "",
+                      "secondary_ticker": "", "trend": "neutral", "avatar_emotion": "shocked"}
+
+
 class WeeklyOutline(_Model):
     week_label: str = Field(description="e.g. 'WEEK ENDING OCT 24'")
     hook: str = Field(description="Specific, irresistible cold-open idea for the first 30 seconds")
@@ -398,6 +458,16 @@ class WeeklyOutline(_Model):
     youtube_title: str
     description: str
     tags: str
+    thumbnail: ThumbnailSpec = Field(description="Design of the YouTube thumbnail (see the THUMBNAIL rules)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_missing_thumbnail(cls, data: Any) -> Any:
+        """Keep old script.json files loadable: no thumbnail -> neutral default instead of a validation error."""
+        if isinstance(data, dict) and not data.get("thumbnail"):
+            logger.warning("Outline has no thumbnail design; using the neutral default")
+            data = {**data, "thumbnail": dict(THUMBNAIL_FALLBACK)}
+        return data
 
 
 class ChapterScript(_Model):
@@ -1351,6 +1421,30 @@ def clean_ticker_text(text: str) -> str:
     return re.sub(r"[^\x20-\x7E\u2022]+", "", text or "").strip()
 
 
+def normalize_thumbnail(t: ThumbnailSpec) -> ThumbnailSpec:
+    """Make the Director's thumbnail safe to draw: at most 3 short UPPERCASE words, clean tickers, a template that
+    has the tickers it needs, and the avatar emotion the template is designed around. Idempotent."""
+    words = re.sub(r"\[\[[^\]]*\]\]", "", ascii_clean(t.main_text)).upper().split()[:3]
+    while len(words) > 1 and len(" ".join(words)) > THUMB_TEXT_MAX_CHARS:
+        words.pop()
+    text = shorten(" ".join(words), THUMB_TEXT_MAX_CHARS) or THUMBNAIL_FALLBACK["main_text"]
+    primary, secondary = clean_ticker(t.primary_ticker), clean_ticker(t.secondary_ticker)
+    if secondary == primary:
+        secondary = ""
+    if secondary and not primary:
+        primary, secondary = secondary, ""
+    wanted = template = ev(t.template)
+    if template in ("divergence", "vs_showdown") and not secondary:
+        template = "chart_alert"
+    if template in ("chart_alert", "magnifying_glass") and not primary:
+        template = "massive_number"
+    if template != wanted:
+        logger.warning("Thumbnail template '%s' needs tickers that were not supplied; using '%s'", wanted, template)
+    emotion = {"massive_number": "shocked", "chart_alert": "pointing"}.get(template, ev(t.avatar_emotion))
+    return ThumbnailSpec(template=template, main_text=text, primary_ticker=primary, secondary_ticker=secondary,
+                         trend=ev(t.trend), avatar_emotion=emotion)
+
+
 def normalize_outline(o: WeeklyOutline) -> WeeklyOutline:
     if not CHAPTERS_MIN <= len(o.chapters) <= CHAPTERS_MAX:
         raise ValueError(f"expected {CHAPTERS_MIN}-{CHAPTERS_MAX} chapters, got {len(o.chapters)}")
@@ -1370,6 +1464,7 @@ def normalize_outline(o: WeeklyOutline) -> WeeklyOutline:
         ch.target_words = None
     o.news_ticker_text = clean_ticker_text(
         o.news_ticker_text) or "WEEKLY RECAP  \u2022  MARKETS  \u2022  NOT FINANCIAL ADVICE"
+    o.thumbnail = normalize_thumbnail(o.thumbnail)
     return o
 
 
@@ -1534,6 +1629,25 @@ STYLE_GUIDE = """
         """
 
 
+THUMBNAIL_GUIDE = """
+        THUMBNAIL. You also design the YouTube thumbnail in the `thumbnail` field. It must sell the video's single
+        biggest tension at a glance and must never promise something the video does not deliver.
+        - template (pick ONE):
+            divergence: two tickers moving in OPPOSITE directions (primary_ticker FALLING, secondary_ticker RISING).
+            vs_showdown: two tickers or companies head to head (primary_ticker vs secondary_ticker).
+            chart_alert: ONE ticker's chart move is the story, e.g. a breakdown or breakout (primary_ticker).
+            warning_sign: a risk, crash or 'be careful' story (primary_ticker optional).
+            magnifying_glass: 'look closer' at ONE ticker or a hidden detail (primary_ticker required).
+            massive_number: one shocking word or number is the story.
+        - main_text: MAX 3 WORDS, UPPERCASE, ultra-punchy (e.g. 'TECH CRASH?', 'BUY NOW?'). No [[placeholders]];
+          include a number only if it appears in the supplied data.
+        - primary_ticker / secondary_ticker: real tickers from the supplied data, or '' (divergence and vs_showdown
+          REQUIRE both; chart_alert and magnifying_glass REQUIRE primary_ticker).
+        - trend: bullish (green), bearish (red) or neutral (gold), matching the overall mood the data supports.
+        - avatar_emotion: shocked, pointing, thinking or neutral.
+        """
+
+
 def generate_outline(ctx: WeeklyContext) -> WeeklyOutline:
     from google.genai import types
     logger.info("Director: planning a retention-first story...")
@@ -1564,10 +1678,11 @@ def generate_outline(ctx: WeeklyContext) -> WeeklyOutline:
             youtube_title (max 70 characters, intriguing but truthful),
             description (a detailed, useful 150-230 word YouTube summary in conversational language, with concrete
             stories from the data, key tickers, questions to watch, and no disclaimer),
-            tags (6-10 comma-separated relevant tags).
+            tags (6-10 comma-separated relevant tags), thumbnail (see THUMBNAIL below).
             Do not make claims that aren't supported by the context. No filler, no empty generalizations.
 
             {STYLE_GUIDE}
+            {THUMBNAIL_GUIDE}
 
             VERIFIED MARKET DATA AND NEWS
             {ctx.text}
@@ -4203,6 +4318,692 @@ def assemble_final_video(scene_paths: List[str], total_seconds: float, output_pa
 
 
 # =====================================================================
+# 14b. THUMBNAIL ENGINE  (Pillow, 1280x720)
+#      The Director's ThumbnailSpec (WeeklyOutline.thumbnail) is drawn here, after the final video exists.
+#      Layout: small pure helpers (background / text / logo / sprite effects)  ->  ThumbnailEngine templates.
+# =====================================================================
+THUMB_WHITE, THUMB_YELLOW, THUMB_BLACK = (255, 255, 255), (255, 214, 10), (0, 0, 0)
+THUMB_BASE = (8, 10, 16)  # near-black every gradient starts from
+THUMB_TREND_RGB = {"bullish": _rgb(C_GREEN), "bearish": _rgb(C_RED), "neutral": _rgb(C_GOLD)}
+THUMB_FONT_CANDIDATES = (  # Impact-style display fonts first; load_font() (Arial Bold / DejaVu Bold) is the fallback
+    "assets/fonts/Anton-Regular.ttf", "assets/fonts/Impact.ttf", r"C:\Windows\Fonts\impact.ttf",
+    "/Library/Fonts/Impact.ttf", "/System/Library/Fonts/Supplemental/Impact.ttf",
+    "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+)
+THUMB_INDEX_LABELS = {"GSPC": "S&P", "IXIC": "NDQ", "DJI": "DOW", "RUT": "R2K", "VIX": "VIX", "TNX": "10Y"}
+THUMB_BADGE_COLORS = ((41, 98, 255), (123, 31, 162), (230, 81, 0), (0, 137, 123), (194, 24, 91), (2, 119, 189))
+THUMB_RESAMPLE = Image.Resampling.LANCZOS
+
+
+# ---------------------------------------------------------------------
+# Pillow utilities
+# ---------------------------------------------------------------------
+@lru_cache(maxsize=256)
+def thumb_font(size: int):
+    for path in THUMB_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, int(size))
+            except OSError:
+                continue
+    return load_font(int(size))
+
+
+def _shade(rgb: Tuple[int, int, int], k: float) -> Tuple[int, int, int]:
+    return tuple(max(0, min(255, int(c * k))) for c in rgb)
+
+
+def _lighten(rgb: Tuple[int, int, int], k: float) -> Tuple[int, int, int]:
+    return tuple(int(c + (255 - c) * k) for c in rgb)
+
+
+def thumb_composite(canvas: Image.Image, layer: Image.Image, x: int, y: int) -> None:
+    """Alpha-composite `layer` onto the RGBA `canvas` with its top-left at (x, y); off-canvas parts are clipped."""
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(canvas.width, x + layer.width), min(canvas.height, y + layer.height)
+    if x1 <= x0 or y1 <= y0:
+        return
+    canvas.alpha_composite(layer.crop((x0 - x, y0 - y, x1 - x, y1 - y)), (x0, y0))
+
+
+def thumb_paste_center(canvas: Image.Image, layer: Image.Image, cx: float, cy: float) -> None:
+    thumb_composite(canvas, layer, int(round(cx - layer.width / 2)), int(round(cy - layer.height / 2)))
+
+
+def vertical_gradient(size: Tuple[int, int], top, bottom) -> Image.Image:
+    w, h = size
+    t = np.linspace(0.0, 1.0, max(1, h), dtype=np.float32)[:, None, None]
+    a, b = np.array(top, np.float32), np.array(bottom, np.float32)
+    rgb = np.broadcast_to(a * (1 - t) + b * t, (h, w, 3))
+    return Image.fromarray(np.dstack([rgb, np.full((h, w, 1), 255, np.float32)]).astype(np.uint8))
+
+
+def sprite_from_mask(fill: Image.Image, mask: Image.Image) -> Image.Image:
+    """RGBA sprite = `fill` colours with `mask` as alpha (no dark fringes, unlike pasting onto transparent black)."""
+    sprite = fill.convert("RGBA")
+    sprite.putalpha(mask)
+    return sprite
+
+
+def aa_disk(size: int, center: Tuple[float, float], radius: float, scale: int = 3) -> Image.Image:
+    """Anti-aliased filled circle as an 'L' mask (drawn at `scale`x, then reduced)."""
+    m = Image.new("L", (size * scale, size * scale), 0)
+    cx, cy, r = center[0] * scale, center[1] * scale, radius * scale
+    ImageDraw.Draw(m).ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+    return m.resize((size, size), THUMB_RESAMPLE)
+
+
+def aa_polygon(size: Tuple[int, int], points: Sequence[Tuple[float, float]], scale: int = 3) -> Image.Image:
+    m = Image.new("L", (size[0] * scale, size[1] * scale), 0)
+    ImageDraw.Draw(m).polygon([(x * scale, y * scale) for x, y in points], fill=255)
+    return m.resize(size, THUMB_RESAMPLE)
+
+
+def dilate_alpha(alpha: Image.Image, radius: float, steps: int = 16) -> Image.Image:
+    """Round dilation of an 'L' mask: the union of copies shifted around circles of decreasing radius."""
+    out = alpha.copy()
+    for k in (1.0, 0.66, 0.33):
+        for i in range(steps):
+            ang = 2 * math.pi * i / steps
+            out = ImageChops.lighter(out, ImageChops.offset(
+                alpha, int(round(radius * k * math.cos(ang))), int(round(radius * k * math.sin(ang)))))
+    return out
+
+
+def add_outline(sprite: Image.Image, px: int, color=THUMB_BLACK) -> Image.Image:
+    """'Sticker' outline: grows the sprite by `px` and paints a solid silhouette of `color` underneath."""
+    pad = px + 3
+    base = Image.new("RGBA", (sprite.width + 2 * pad, sprite.height + 2 * pad), (0, 0, 0, 0))
+    base.alpha_composite(sprite, (pad, pad))
+    grown = dilate_alpha(base.getchannel("A"), px).filter(ImageFilter.GaussianBlur(0.8))
+    ring = Image.new("RGBA", base.size, tuple(color) + (0,))
+    ring.putalpha(grown)
+    ring.alpha_composite(base)
+    return ring
+
+
+def glow_from_alpha(layer: Image.Image, color, radius: float, strength: float = 1.0) -> Image.Image:
+    """Soft glow (same size as `layer`) made from the layer's alpha channel. `layer` needs >= 2*radius of padding."""
+    a = layer.getchannel("A").filter(ImageFilter.GaussianBlur(radius))
+    if strength != 1.0:
+        a = a.point(lambda v: min(255, int(v * strength)))
+    glow = Image.new("RGBA", layer.size, tuple(color) + (0,))
+    glow.putalpha(a)
+    return glow
+
+
+def decorate_sprite(sprite: Image.Image, shadow: Optional[Tuple[int, int]] = (8, 12), shadow_blur: float = 8,
+                    shadow_opacity: float = 0.7, glow=None, glow_radius: float = 24,
+                    glow_strength: float = 1.5) -> Image.Image:
+    """Adds padding + (optional) coloured glow + (optional) drop shadow around a sprite. The sprite stays centred."""
+    pad = int((max(abs(shadow[0]), abs(shadow[1])) if shadow else 0) + shadow_blur * 3 +
+              (glow_radius * 2 if glow else 0) + 4)
+    base = Image.new("RGBA", (sprite.width + 2 * pad, sprite.height + 2 * pad), (0, 0, 0, 0))
+    base.alpha_composite(sprite, (pad, pad))
+    out = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    if glow is not None:
+        out.alpha_composite(glow_from_alpha(base, glow, glow_radius, glow_strength))
+    if shadow:
+        shifted = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        shifted.alpha_composite(base, (shadow[0], shadow[1]))
+        out.alpha_composite(glow_from_alpha(shifted, THUMB_BLACK, shadow_blur, shadow_opacity))
+    out.alpha_composite(base)
+    return out
+
+
+# ---------------------------------------------------------------------
+# Backgrounds
+# ---------------------------------------------------------------------
+def make_gradient(w: int, h: int, color, spot=(0.5, 0.4), strength: float = 0.4, base=THUMB_BASE) -> Image.Image:
+    """Dark, rich radial gradient: `color` glows around `spot` (fractions of w/h) and fades into near-black."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx, dy = (xx / w - spot[0]) * (w / h), yy / h - spot[1]
+    k = (np.clip(1.0 - np.sqrt(dx * dx + dy * dy) / 0.95, 0.0, 1.0) ** 1.5 * strength)[..., None]
+    rgb = np.array(base, np.float32) * (1 - k) + np.array(color, np.float32) * k
+    rgb *= (1.0 - 0.35 * (yy / h))[..., None]  # a little darker towards the bottom for depth
+    return Image.fromarray(np.dstack([rgb, np.full((h, w, 1), 255, np.float32)]).clip(0, 255).astype(np.uint8))
+
+
+def make_grid(w: int, h: int, color, spacing: int = 64, alpha: int = 28) -> Image.Image:
+    """Subtle chart-paper grid that fades towards the top, like a floor under the subject."""
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    line = tuple(color) + (alpha,)
+    for x in range(0, w + 1, spacing):
+        d.line([(x, 0), (x, h)], fill=line, width=2)
+    for y in range(0, h + 1, spacing):
+        d.line([(0, y), (w, y)], fill=line, width=2)
+    fade = np.linspace(0.2, 1.0, h, dtype=np.float32)[:, None]
+    layer.putalpha(Image.fromarray((np.asarray(layer.getchannel("A"), np.float32) * fade).astype(np.uint8)))
+    return layer
+
+
+def draw_trend_background(w: int, h: int, color, grid: bool = True, spot=(0.5, 0.4),
+                          strength: float = 0.4) -> Image.Image:
+    """Background for a trend colour (green / red / gold): dark radial gradient, optionally with the subtle grid."""
+    bg = make_gradient(w, h, color, spot, strength)
+    if grid:
+        bg.alpha_composite(make_grid(w, h, _lighten(color, 0.3)))
+    return bg
+
+
+def make_sunburst(w: int, h: int, center: Tuple[float, float], color, rays: int = 22, alpha: int = 38) -> Image.Image:
+    layer = Image.new("RGBA", (w, h), tuple(color) + (0,))
+    d = ImageDraw.Draw(layer)
+    reach = math.hypot(w, h)
+    for i in range(rays):
+        a0, a1 = 2 * math.pi * i / rays, 2 * math.pi * (i + 0.5) / rays
+        d.polygon([center, (center[0] + reach * math.cos(a0), center[1] + reach * math.sin(a0)),
+                   (center[0] + reach * math.cos(a1), center[1] + reach * math.sin(a1))],
+                  fill=tuple(color) + (alpha,))
+    return layer
+
+
+def make_candle_layer(w: int, h: int, trend: str, seed: int, n: int = 5, blur: float = 8,
+                      opacity: float = 0.8) -> Image.Image:
+    """Giant, blurred candlesticks staircasing with the trend (deterministic per episode)."""
+    rnd = random.Random(seed)
+    step = {"bullish": 0.11, "bearish": -0.11}.get(trend, 0.0)
+    up_c, down_c = ((_rgb(C_GREEN), _rgb(C_RED)) if trend != "neutral" else (_rgb(C_GOLD), (150, 120, 40)))
+    price, candles = 0.5 - step * n / 2, []
+    for _ in range(n):
+        o = price
+        c = o + (step * 1.7 + rnd.uniform(-0.05, 0.05) if step else rnd.uniform(-0.18, 0.18))
+        candles.append((o, c, max(o, c) + rnd.uniform(0.05, 0.14), min(o, c) - rnd.uniform(0.05, 0.14)))
+        price = o + step + rnd.uniform(-0.04, 0.04)  # the next candle opens along the trend -> overlapping staircase
+    lo, hi = min(cd[3] for cd in candles), max(cd[2] for cd in candles)
+    y_of = lambda v: h * (0.94 - (v - lo) / max(1e-6, hi - lo) * 0.88)
+    layer = Image.new("RGBA", (w, h), tuple(up_c if step >= 0 else down_c) + (0,))
+    d = ImageDraw.Draw(layer)
+    slot = w / n
+    for i, (o, c, high, low) in enumerate(candles):
+        x = slot * (i + 0.5)
+        col = tuple(up_c if c >= o else down_c) + (int(255 * opacity),)
+        d.line([(x, y_of(high)), (x, y_of(low))], fill=col, width=int(slot * 0.11))
+        d.rectangle((x - slot * 0.23, min(y_of(o), y_of(c)), x + slot * 0.23, max(y_of(o), y_of(c)) + 6), fill=col)
+    return layer.filter(ImageFilter.GaussianBlur(blur))
+
+
+# ---------------------------------------------------------------------
+# YouTube text: thick black outline + gradient fill + soft drop shadow (+ optional colour glow)
+# ---------------------------------------------------------------------
+def _cap_height(font) -> int:
+    box = font.getbbox("H")
+    return box[3] - box[1]
+
+
+def _partitions(words: List[str]) -> List[List[str]]:
+    """Every way to break up to 3 words into lines, one-line first (ties keep the fewer lines)."""
+    out = [[" ".join(words)]]
+    if len(words) >= 2:
+        out += [[" ".join(words[:i]), " ".join(words[i:])] for i in range(1, len(words))]
+    if len(words) == 3:
+        out.append(list(words))
+    return out
+
+
+def fit_headline(text: str, max_w: float, max_h: float, max_size: int = 320, min_size: int = 36):
+    """Choose the line break + font size that makes `text` as BIG as possible inside the box.
+    Returns (lines, font, stroke_px, line_pitch_px)."""
+    best = None
+    for lines in _partitions((text or "?").split()):
+        for size in range(max_size, min_size - 1, -2):
+            font = thumb_font(size)
+            stroke = max(3, round(size * 0.085))
+            cap = _cap_height(font)
+            pitch = cap + stroke * 1.4
+            boxes = [font.getbbox(ln, stroke_width=stroke) for ln in lines]
+            width = max(bx[2] - bx[0] for bx in boxes)
+            height = (len(lines) - 1) * pitch + cap + 2 * stroke
+            if (width <= max_w and height <= max_h) or size == min_size:
+                if best is None or size > best[0]:
+                    best = (size, lines, font, stroke, pitch)
+                break
+    return best[1], best[2], best[3], best[4]
+
+
+def render_text_sprite(text: str, font, fill, stroke: int) -> Image.Image:
+    """One line of text as an RGBA sprite: solid black outline of `stroke` px + top-to-bottom gradient fill."""
+    l, t, r, b = font.getbbox(text, stroke_width=stroke)
+    origin = (-l, -t)
+    mask = Image.new("L", (r - l, b - t), 0)
+    ImageDraw.Draw(mask).text(origin, text, font=font, fill=255)
+    face = sprite_from_mask(vertical_gradient(mask.size, fill, _shade(fill, 0.9)), mask)
+    if not stroke:
+        return face
+    sprite = Image.new("RGBA", mask.size, (0, 0, 0, 0))
+    ImageDraw.Draw(sprite).text(origin, text, font=font, fill=THUMB_BLACK + (255,), stroke_width=stroke,
+                                stroke_fill=THUMB_BLACK + (255,))
+    sprite.alpha_composite(face)
+    return sprite
+
+
+def draw_youtube_text(canvas: Image.Image, text: str, center: Tuple[float, float], font, fill=THUMB_WHITE,
+                      stroke: Optional[int] = None, shadow: bool = True, glow=None, glow_radius: float = 24,
+                      glow_strength: float = 1.6) -> None:
+    """The YouTube look: bold, bright fill, THICK black outline, slight drop shadow, optional glow.
+    The outline uses Pillow's native stroker (the clean version of 'draw the text with many x/y offsets')."""
+    size = getattr(font, "size", 64)
+    stroke = max(3, round(size * 0.085)) if stroke is None else stroke
+    off = max(3, round(size * 0.045))
+    sprite = decorate_sprite(render_text_sprite(text, font, fill, stroke),
+                             shadow=(off, int(off * 1.4)) if shadow else None, shadow_blur=max(2, off),
+                             shadow_opacity=0.75, glow=glow, glow_radius=glow_radius, glow_strength=glow_strength)
+    thumb_paste_center(canvas, sprite, *center)
+
+
+def draw_text_block(canvas: Image.Image, lines: List[str], center: Tuple[float, float], font, fills: Sequence,
+                    stroke: int, pitch: float, **kw) -> None:
+    top = center[1] - (len(lines) - 1) * pitch / 2
+    for i, line in enumerate(lines):
+        draw_youtube_text(canvas, line, (center[0], top + i * pitch), font, fills[i % len(fills)], stroke, **kw)
+
+
+# ---------------------------------------------------------------------
+# Logos: local cache / existing downloader -> Logo.dev ticker API -> coloured circle with the ticker inside
+# ---------------------------------------------------------------------
+_THUMB_LOGO_MISS: set = set()
+
+
+def download_logo_dev(ticker: str) -> Optional[str]:
+    """Optional online source. logo.clearbit.com was shut down (Dec 2025); its successor Logo.dev has a
+    ticker endpoint but needs a free publishable key in LOGO_DEV_TOKEN. Result is cached in assets/logos/."""
+    token = get_secret("LOGO_DEV_TOKEN")
+    if not token or not ticker or ticker.startswith("^") or ticker in _THUMB_LOGO_MISS:
+        return None
+    dest = LOGO_DIR / f"{ticker}.png"
+    try:
+        import requests
+        r = requests.get(f"https://img.logo.dev/ticker/{ticker}",
+                         params={"token": token, "format": "png", "size": 512, "fallback": "404"}, timeout=8)
+        if r.ok and len(r.content) > 600:
+            LOGO_DIR.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(r.content)
+            Image.open(dest).verify()
+            return str(dest)
+    except Exception as e:
+        logger.info("Logo.dev lookup failed for %s: %s", ticker, e)
+        dest.unlink(missing_ok=True)
+    _THUMB_LOGO_MISS.add(ticker)
+    return None
+
+
+def fetch_company_logo(ticker: str) -> Optional[Image.Image]:
+    """RGBA logo with transparent margins trimmed, or None (caller draws the fallback badge)."""
+    ticker = clean_ticker(ticker)
+    if not ticker or ticker.startswith("^"):
+        return None
+    path = ensure_logo(ticker) or download_logo_dev(ticker)
+    if not path:
+        return None
+    try:
+        with Image.open(path) as im:
+            logo = im.convert("RGBA")
+        box = logo.getchannel("A").getbbox()
+        return logo.crop(box) if box else None
+    except Exception as e:
+        logger.warning("Unreadable logo for %s: %s", ticker, e)
+        return None
+
+
+def thumb_ticker_label(ticker: str) -> str:
+    t = clean_ticker(ticker)
+    return THUMB_INDEX_LABELS.get(t.lstrip("^"), t.lstrip("^")) if t else "?"
+
+
+def make_logo_badge(ticker: str, diameter: int, ring: int = 8) -> Image.Image:
+    """Round badge (black ring + white disc) holding the company logo. If the logo cannot be fetched, a coloured
+    disc with the ticker symbol is drawn instead, so a missing logo never breaks the thumbnail."""
+    d = diameter
+    sprite = Image.new("RGBA", (d, d), (0, 0, 0, 0))
+    sprite.paste(THUMB_BLACK + (255,), (0, 0, d, d), aa_disk(d, (d / 2, d / 2), d / 2))
+    inner = aa_disk(d, (d / 2, d / 2), d / 2 - ring)
+    logo = fetch_company_logo(ticker)
+    if logo is not None:
+        sprite.paste((255, 255, 255, 255), (0, 0, d, d), inner)
+        box = d * 0.64  # a square logo must stay inside the circle
+        k = min(box / logo.width, box / logo.height)
+        logo = logo.resize((max(1, int(logo.width * k)), max(1, int(logo.height * k))), THUMB_RESAMPLE)
+        sprite.alpha_composite(logo, ((d - logo.width) // 2, (d - logo.height) // 2))
+        return sprite
+    color = THUMB_BADGE_COLORS[zlib.crc32(clean_ticker(ticker).encode()) % len(THUMB_BADGE_COLORS)]
+    sprite.paste(vertical_gradient((d, d), _lighten(color, 0.18), _shade(color, 0.7)), (0, 0), inner)
+    label = thumb_ticker_label(ticker)
+    _, font, stroke, _ = fit_headline(label, d * 0.70, d * 0.36, max_size=int(d * 0.40), min_size=14)
+    draw_youtube_text(sprite, label, (d / 2, d / 2), font, THUMB_WHITE, stroke=max(2, stroke // 2), shadow=False)
+    return sprite
+
+
+# ---------------------------------------------------------------------
+# Avatar (your PNG cut-outs; a drawn placeholder is used when a file is missing) and props
+# ---------------------------------------------------------------------
+def make_placeholder_avatar(emotion: str, height: int) -> Image.Image:
+    """Cartoon stand-in so the pipeline works before the real avatar PNGs exist."""
+    S = 3
+    u = height * S
+    im = Image.new("RGBA", (int(0.9 * u), u), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    cx = 0.405 * u
+    skin, suit, shirt, tie, hair, ink = (255, 205, 160, 255), (28, 36, 54, 255), (245, 245, 250, 255), \
+        (0, 229, 255, 255), (96, 64, 42, 255), (28, 20, 18, 255)
+
+    def limb(p0, p1, w, col):
+        d.line([p0, p1], fill=col, width=int(w * u))
+        for p in (p0, p1):
+            d.ellipse((p[0] - w * u / 2, p[1] - w * u / 2, p[0] + w * u / 2, p[1] + w * u / 2), fill=col)
+
+    def hand(p, r=0.05):
+        d.ellipse((p[0] - r * u, p[1] - r * u, p[0] + r * u, p[1] + r * u), fill=skin)
+
+    d.ellipse((cx - 0.33 * u, 0.66 * u, cx + 0.33 * u, 1.35 * u), fill=suit)
+    d.rectangle((cx - 0.06 * u, 0.56 * u, cx + 0.06 * u, 0.72 * u), fill=(235, 185, 140, 255))
+    d.polygon([(cx - 0.08 * u, 0.69 * u), (cx + 0.08 * u, 0.69 * u), (cx, 0.87 * u)], fill=shirt)
+    d.polygon([(cx - 0.025 * u, 0.75 * u), (cx + 0.025 * u, 0.75 * u), (cx + 0.035 * u, 1.0 * u),
+               (cx, 1.03 * u), (cx - 0.035 * u, 1.0 * u)], fill=tie)
+    d.ellipse((cx - 0.215 * u, 0.12 * u, cx + 0.215 * u, 0.50 * u), fill=hair)
+    for sx in (-1, 1):
+        d.ellipse((cx + sx * 0.2 * u - 0.03 * u, 0.36 * u, cx + sx * 0.2 * u + 0.03 * u, 0.46 * u), fill=skin)
+    d.ellipse((cx - 0.2 * u, 0.16 * u, cx + 0.2 * u, 0.62 * u), fill=skin)
+    d.chord((cx - 0.2 * u, 0.16 * u, cx + 0.2 * u, 0.62 * u), 207, 333, fill=hair)
+    ex, ey = 0.075 * u, 0.40 * u
+    if emotion == "shocked":
+        for sx in (-1, 1):
+            d.ellipse((cx + sx * ex - 0.05 * u, ey - 0.055 * u, cx + sx * ex + 0.05 * u, ey + 0.055 * u),
+                      fill=(255, 255, 255, 255), outline=ink, width=int(0.006 * u))
+            d.ellipse((cx + sx * ex - 0.016 * u, ey - 0.016 * u, cx + sx * ex + 0.016 * u, ey + 0.016 * u), fill=ink)
+            d.arc((cx + sx * ex - 0.06 * u, ey - 0.15 * u, cx + sx * ex + 0.06 * u, ey - 0.05 * u), 200, 340,
+                  fill=ink, width=int(0.016 * u))
+        d.ellipse((cx - 0.05 * u, 0.50 * u, cx + 0.05 * u, 0.59 * u), fill=(120, 20, 30, 255))
+        d.ellipse((cx - 0.03 * u, 0.55 * u, cx + 0.03 * u, 0.59 * u), fill=(230, 90, 100, 255))
+        for sx in (-1, 1):
+            limb((cx + sx * 0.29 * u, 0.9 * u), (cx + sx * 0.27 * u, 0.52 * u), 0.085, suit)
+            hand((cx + sx * 0.27 * u, 0.50 * u))
+    else:
+        for sx in (-1, 1):
+            look = 0.012 * u if emotion == "pointing" else (-0.012 * u if emotion == "thinking" else 0)
+            d.ellipse((cx + sx * ex - 0.034 * u, ey - 0.036 * u, cx + sx * ex + 0.034 * u, ey + 0.036 * u),
+                      fill=(255, 255, 255, 255), outline=ink, width=int(0.005 * u))
+            d.ellipse((cx + sx * ex + look - 0.014 * u, ey - 0.014 * u - (0.01 * u if emotion == "thinking" else 0),
+                       cx + sx * ex + look + 0.014 * u, ey + 0.014 * u - (0.01 * u if emotion == "thinking" else 0)),
+                      fill=ink)
+        brow = int(0.016 * u)
+        right_brow = {"pointing": (0.335, 0.285), "thinking": (0.29, 0.335)}.get(emotion, (0.335, 0.335))  # (inner, outer) y
+        d.line([(cx - ex - 0.04 * u, 0.335 * u), (cx - ex + 0.04 * u, 0.335 * u)], fill=ink, width=brow)
+        d.line([(cx + ex - 0.04 * u, right_brow[0] * u), (cx + ex + 0.04 * u, right_brow[1] * u)], fill=ink,
+               width=brow)
+        if emotion == "thinking":
+            d.line([(cx - 0.03 * u, 0.54 * u), (cx + 0.05 * u, 0.53 * u)], fill=ink, width=int(0.012 * u))
+            limb((cx + 0.28 * u, 0.9 * u), (cx + 0.13 * u, 0.66 * u), 0.085, suit)
+            hand((cx + 0.11 * u, 0.62 * u))
+        else:
+            d.arc((cx - 0.07 * u, 0.44 * u, cx + 0.07 * u, 0.58 * u), 20, 160, fill=ink, width=int(0.013 * u))
+            if emotion == "pointing":
+                limb((cx + 0.27 * u, 0.9 * u), (cx + 0.42 * u, 0.75 * u), 0.085, suit)
+                limb((cx + 0.43 * u, 0.745 * u), (0.885 * u, 0.745 * u), 0.034, skin)
+                hand((cx + 0.43 * u, 0.75 * u), 0.048)
+    return im.resize((int(0.9 * height), height), THUMB_RESAMPLE)
+
+
+def load_avatar(emotion: str, height: int) -> Image.Image:
+    """Avatar PNG for the emotion scaled to `height`; falls back to the drawn placeholder."""
+    path = THUMB_AVATAR_PATHS.get(emotion, THUMB_AVATAR_PATHS["neutral"])
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGBA")
+        return im.resize((max(1, round(im.width * height / im.height)), height), THUMB_RESAMPLE)
+    except Exception as e:
+        logger.warning("Thumbnail avatar missing (%s): %s - drawing a placeholder", path, e)
+        return make_placeholder_avatar(emotion, height)
+
+
+def make_block_arrow(direction: str, length: int, width: int, color, outline_px: int = 9) -> Image.Image:
+    """Chunky arrow with a thick black outline. `length` = tail-to-tip, `width` = arrow-head width."""
+    S, pad = 3, 4 * 3
+    L, Wd = length * S, width * S
+    m = Image.new("L", (Wd + 2 * pad, L + 2 * pad), 0)
+    d, cx, head = ImageDraw.Draw(m), Wd / 2 + pad, L * 0.5
+    d.polygon([(cx, pad), (cx + Wd / 2, pad + head), (cx - Wd / 2, pad + head)], fill=255)
+    d.rectangle((cx - Wd * 0.23, pad + head - 3, cx + Wd * 0.23, pad + L), fill=255)
+    m = m.resize((m.width // S, m.height // S), THUMB_RESAMPLE)
+    arrow = add_outline(sprite_from_mask(vertical_gradient(m.size, _lighten(color, 0.3), color), m), outline_px)
+    angle = {"up": 0, "left": 90, "down": 180, "right": -90}[direction]
+    return arrow.rotate(angle, expand=True, resample=Image.Resampling.BICUBIC)
+
+
+def make_hazard_sign(text: str, w: int = 1060, h: int = 340) -> Image.Image:
+    """Yellow caution sign (black frame, hazard-stripe bars, screws) with `text` in black inside."""
+    S, r, bar = 2, 34, 38
+    big = (w * S, h * S)
+
+    def rounded(box, radius):
+        m = Image.new("L", big, 0)
+        ImageDraw.Draw(m).rounded_rectangle([v * S for v in box], radius=radius * S, fill=255)
+        return m.resize((w, h), THUMB_RESAMPLE)
+
+    sign = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    sign.paste(THUMB_BLACK + (255,), (0, 0, w, h), rounded((0, 0, w, h), r))
+    face = vertical_gradient((w, h), (255, 226, 52), (255, 186, 0))
+    sign.paste(face, (0, 0), rounded((12, 12, w - 12, h - 12), r - 8))
+    stripes = Image.new("RGBA", (w - 48, bar), (255, 204, 0, 255))
+    sd = ImageDraw.Draw(stripes)
+    for x in range(-bar, w, 60):
+        sd.polygon([(x, bar), (x + 30, bar), (x + 30 + bar, 0), (x + bar, 0)], fill=(15, 15, 15, 255))
+    sign.alpha_composite(stripes, (24, 24))
+    sign.alpha_composite(stripes, (24, h - 24 - bar))
+    d = ImageDraw.Draw(sign)
+    for sx in (50, w - 50):
+        for sy in (24 + bar + 28, h - 24 - bar - 28):
+            d.ellipse((sx - 8, sy - 8, sx + 8, sy + 8), fill=(55, 55, 55, 255))
+            d.ellipse((sx - 4, sy - 6, sx, sy - 2), fill=(150, 150, 150, 255))
+    box_w, box_h = w - 150, h - 2 * (24 + bar) - 36
+    lines, font, _, pitch = fit_headline(text, box_w, box_h, max_size=260, min_size=30)
+    draw_text_block(sign, lines, (w / 2, h / 2), font, [(18, 18, 18)], 0, pitch, shadow=False)
+    return sign
+
+
+# ---------------------------------------------------------------------
+# The engine
+# ---------------------------------------------------------------------
+class ThumbnailEngine:
+    """Renders a ThumbnailSpec as a 1280x720 PNG.
+
+        ThumbnailEngine(spec).save("THUMBNAIL_WEEKLY_RECAP_2026-10-27.png")
+
+    Every template follows the same order: background -> big props (logos, candles, lens) -> avatar -> text last,
+    so the headline is always the top layer. Keep the bottom-right corner (YouTube's duration badge) free."""
+
+    W, H = THUMB_W, THUMB_H
+    LENS_CENTER, LENS_RADIUS = (860, 395), 212
+    LENS_GRIP = (395, 600)  # where the handle ends: tune it to the hand of your own 'thinking' avatar PNG
+
+    def __init__(self, spec: ThumbnailSpec):
+        self.spec = normalize_thumbnail(spec)  # idempotent: also protects hand-edited / old script.json files
+        self.template = ev(self.spec.template)
+        self.trend = ev(self.spec.trend)
+        self.color = THUMB_TREND_RGB.get(self.trend, THUMB_TREND_RGB["neutral"])
+        self.text = self.spec.main_text
+        self.primary, self.secondary = self.spec.primary_ticker, self.spec.secondary_ticker
+        self.emotion = ev(self.spec.avatar_emotion)
+        self.seed = zlib.crc32(f"{self.template}|{self.text}|{self.primary}".encode())
+        self.canvas = Image.new("RGBA", (self.W, self.H), THUMB_BASE + (255,))
+
+    # ----- public API -----
+    def render(self) -> Image.Image:
+        getattr(self, f"_tpl_{self.template}", self._tpl_massive_number)()
+        self._finish()
+        return self.canvas.convert("RGB")
+
+    def save(self, path) -> str:
+        """Write the PNG. YouTube rejects thumbnails over 2 MB, so an oversized file is re-saved with a palette."""
+        img = self.render()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(path, "PNG", optimize=True)
+        if path.stat().st_size > THUMB_MAX_BYTES:
+            img.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG) \
+                .save(path, "PNG", optimize=True)
+            logger.info("Thumbnail exceeded %.1f MB; re-saved with a 256-colour palette", THUMB_MAX_BYTES / 1e6)
+        return str(path)
+
+    # ----- shared building blocks -----
+    def _headline(self, center, box, max_size: int = 300, fills=None, glow=None, glow_radius: float = 26,
+                  glow_strength: float = 1.6) -> None:
+        lines, font, stroke, pitch = fit_headline(self.text, box[0], box[1], max_size)
+        fills = fills or ([THUMB_WHITE] * (len(lines) - 1) + [THUMB_YELLOW] if len(lines) > 1 else [THUMB_WHITE])
+        draw_text_block(self.canvas, lines, center, font, fills, stroke, pitch, glow=glow, glow_radius=glow_radius,
+                        glow_strength=glow_strength)
+
+    def _avatar(self, cx: float, height: int, bottom: Optional[float] = None, glow: bool = True) -> None:
+        sprite = add_outline(load_avatar(self.emotion, height), 8, THUMB_WHITE)
+        deco = decorate_sprite(sprite, shadow=(10, 14), shadow_blur=10, glow=self.color if glow else None,
+                               glow_radius=28, glow_strength=1.1)
+        bottom = self.H + 6 if bottom is None else bottom
+        thumb_paste_center(self.canvas, deco, cx, bottom - sprite.height / 2)
+
+    def _logo(self, ticker: str, diameter: int, center, glow=None) -> None:
+        deco = decorate_sprite(make_logo_badge(ticker, diameter), shadow=(8, 12), shadow_blur=9, glow=glow,
+                               glow_radius=30, glow_strength=1.5)
+        thumb_paste_center(self.canvas, deco, *center)
+
+    def _prop(self, sprite: Image.Image, center, glow=None) -> None:
+        thumb_paste_center(self.canvas, decorate_sprite(sprite, glow=glow, glow_radius=22), *center)
+
+    def _bg(self, **kw) -> None:
+        self.canvas = draw_trend_background(self.W, self.H, self.color, **kw)
+
+    def _glowing_line(self, points, width: int, color=THUMB_WHITE, glow=None) -> None:
+        layer = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).line(points, fill=tuple(color) + (255,), width=width, joint="curve")
+        self.canvas.alpha_composite(glow_from_alpha(layer, glow or self.color, 14, 2.0))
+        self.canvas.alpha_composite(layer)
+
+    def _finish(self) -> None:
+        """Vignette + a little extra punch, the last thing applied to every template."""
+        w, h = self.canvas.size
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        r = np.sqrt(((xx / w - 0.5) * 1.2) ** 2 + (yy / h - 0.5) ** 2)
+        v = (1.0 - 0.42 * np.clip((r - 0.40) / 0.5, 0, 1) ** 1.4)[..., None]
+        rgb = np.asarray(self.canvas.convert("RGB"), np.float32) * v
+        img = Image.fromarray(rgb.clip(0, 255).astype(np.uint8))
+        img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.12)).enhance(1.06)
+        self.canvas = img.convert("RGBA")
+
+    # ----- templates -----
+    def _tpl_divergence(self) -> None:
+        """Diagonal red | green split. Primary (falling) left, secondary (rising) right, avatar between."""
+        W, H = self.W, self.H
+        red, green = THUMB_TREND_RGB["bearish"], THUMB_TREND_RGB["bullish"]
+        left = draw_trend_background(W, H, red, spot=(0.15, 0.5), strength=0.85)
+        right = draw_trend_background(W, H, green, spot=(0.85, 0.5), strength=0.85)
+        top_x, bottom_x = 800, 480
+        self.canvas = right
+        self.canvas.paste(left, (0, 0), aa_polygon((W, H), [(0, 0), (top_x, 0), (bottom_x, H), (0, H)]))
+        self._glowing_line([(top_x, -10), (bottom_x, H + 10)], 12, THUMB_WHITE, glow=THUMB_WHITE)
+        self._logo(self.primary, 270, (205, 405), glow=red)
+        self._logo(self.secondary, 270, (1075, 405), glow=green)
+        self._avatar(640, 570)
+        self._prop(make_block_arrow("down", 130, 118, red), (205, 622))
+        self._prop(make_block_arrow("up", 130, 118, green), (1075, 622))
+        self._headline((640, 105), (1160, 170), 280)
+
+    def _tpl_chart_alert(self) -> None:
+        """Giant blurred candlesticks behind a huge headline; avatar points at the primary ticker's logo."""
+        self._bg(strength=0.32)
+        self.canvas.alpha_composite(make_candle_layer(self.W, self.H, self.trend, self.seed))
+        self._logo(self.primary, 330, (950, 480), glow=self.color)
+        self._avatar(285, 470)
+        self._prop(make_block_arrow("right", 190, 120, THUMB_YELLOW), (640, 500))
+        self._headline((640, 150), (1200, 250), 330, glow=self.color, glow_radius=30)
+
+    def _tpl_vs_showdown(self) -> None:
+        """Vertical (lightning-edged) split: primary left, secondary right, massive VS in the middle."""
+        W, H = self.W, self.H
+        blue, orange = _rgb(COLOR_THEMES["blue"]), _rgb(COLOR_THEMES["orange"])
+        zig = [(650, 0), (618, 150), (664, 300), (616, 450), (662, 600), (632, H)]
+        self.canvas = draw_trend_background(W, H, orange, spot=(0.85, 0.5), strength=0.75)
+        self.canvas.paste(draw_trend_background(W, H, blue, spot=(0.15, 0.5), strength=0.75), (0, 0),
+                          aa_polygon((W, H), [(0, 0)] + zig + [(0, H)]))
+        self._glowing_line([(650, -10)] + zig[1:-1] + [(632, H + 10)], 12, THUMB_WHITE, glow=self.color)
+        self._logo(self.primary, 340, (235, 410), glow=blue)
+        self._logo(self.secondary, 340, (1045, 410), glow=orange)
+        lines, font, stroke, pitch = fit_headline("VS", 440, 340, 420)
+        draw_text_block(self.canvas, lines, (640, 395), font, [THUMB_YELLOW], stroke, pitch, glow=self.color,
+                        glow_radius=38, glow_strength=2.0)
+        self._headline((640, 85), (1180, 130), 200)
+
+    def _tpl_warning_sign(self) -> None:
+        """Big avatar centred; a tilted yellow caution sign across its chest carries the headline in black."""
+        self._bg(strength=0.42, spot=(0.5, 0.45))
+        self.canvas.alpha_composite(make_sunburst(self.W, self.H, (640, 360), self.color))
+        if self.primary:
+            self._logo(self.primary, 200, (1140, 150), glow=self.color)
+        self._avatar(640, 700, bottom=self.H + 30)
+        sign = make_hazard_sign(self.text, 1040, 320).rotate(3, expand=True, resample=Image.Resampling.BICUBIC)
+        self._prop(sign, (640, 528))
+
+    def _tpl_magnifying_glass(self) -> None:
+        """Blurred market backdrop; avatar (left) holds a lens that shows the primary ticker's logo sharp and huge."""
+        W, H = self.W, self.H
+        self._bg(strength=0.38)
+        self.canvas.alpha_composite(make_candle_layer(W, H, self.trend, self.seed, n=7, blur=3, opacity=0.9))
+        sharp = self.canvas.copy()
+        self.canvas = ImageEnhance.Brightness(sharp.convert("RGB").filter(ImageFilter.GaussianBlur(11))) \
+            .enhance(0.75).convert("RGBA")
+        self._avatar(270, 570, bottom=H + 8, glow=False)
+        lens_c, R, hand = self.LENS_CENTER, self.LENS_RADIUS, self.LENS_GRIP
+        dx, dy = hand[0] - lens_c[0], hand[1] - lens_c[1]
+        k = R / math.hypot(dx, dy)
+        start = (lens_c[0] + dx * k, lens_c[1] + dy * k)
+        handle = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        hd = ImageDraw.Draw(handle)
+        mid = (start[0] + (hand[0] - start[0]) * 0.42, start[1] + (hand[1] - start[1]) * 0.42)
+        for pts, wd, col in (((start, hand), 58, THUMB_BLACK), ((start, mid), 40, (205, 210, 220)),
+                             ((mid, hand), 40, (45, 48, 56))):
+            hd.line(pts, fill=col + (255,), width=wd)
+            for p in pts:
+                hd.ellipse((p[0] - wd / 2, p[1] - wd / 2, p[0] + wd / 2, p[1] + wd / 2), fill=col + (255,))
+        self.canvas.alpha_composite(glow_from_alpha(handle, THUMB_BLACK, 8, 0.7).transform(
+            (W, H), Image.Transform.AFFINE, (1, 0, -8, 0, 1, -12)))
+        self.canvas.alpha_composite(handle)
+        # lens: magnified (1.25x) sharp backdrop + huge logo + glass reflection, inside a thick ring
+        S = 2 * (R + 12)
+        c = (S / 2, S / 2)
+        r_in = R - 26
+        zoom = sharp.crop((int(lens_c[0] - r_in / 1.25), int(lens_c[1] - r_in / 1.25),
+                           int(lens_c[0] + r_in / 1.25), int(lens_c[1] + r_in / 1.25))).resize(
+            (int(2 * r_in), int(2 * r_in)), THUMB_RESAMPLE)
+        content = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        content.alpha_composite(ImageEnhance.Brightness(zoom.convert("RGB")).enhance(1.35).convert("RGBA"),
+                                (int(c[0] - r_in), int(c[1] - r_in)))
+        badge = make_logo_badge(self.primary, int(r_in * 1.5))
+        content.alpha_composite(badge, (int(c[0] - badge.width / 2), int(c[1] - badge.height / 2)))
+        shine = Image.new("RGBA", (S, S), (255, 255, 255, 0))
+        ImageDraw.Draw(shine).arc((c[0] - r_in * 0.82, c[1] - r_in * 0.82, c[0] + r_in * 0.82, c[1] + r_in * 0.82),
+                                  200, 262, fill=(255, 255, 255, 140), width=14)
+        content.alpha_composite(shine.filter(ImageFilter.GaussianBlur(1.5)))
+        lens = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        lens.paste(THUMB_BLACK + (255,), (0, 0, S, S), aa_disk(S, c, R + 9))
+        lens.paste(self.color + (255,), (0, 0, S, S), aa_disk(S, c, R))
+        lens.paste(THUMB_BLACK + (255,), (0, 0, S, S), aa_disk(S, c, r_in + 7))
+        lens.paste(content, (0, 0), aa_disk(S, c, r_in))
+        self._prop(lens, lens_c, glow=self.color)
+        self._headline((640, 92), (1200, 150), 260, glow=self.color, glow_radius=24)
+
+    def _tpl_massive_number(self) -> None:
+        """Minimalist dark canvas: shocked avatar left, headline enormous on the right with a strong colour glow."""
+        self._bg(grid=False, spot=(0.78, 0.5), strength=0.30)
+        self._avatar(235, 620, bottom=self.H + 4)
+        top = 40
+        if self.primary:
+            self._logo(self.primary, 120, (1190, 90), glow=self.color)
+            top = 150
+        box_h = self.H - 30 - top
+        self._headline((895, top + box_h / 2), (760, box_h), 340,
+                       fills=[_lighten(self.color, 0.18)], glow=self.color, glow_radius=36, glow_strength=2.4)
+
+
+# =====================================================================
 # 15. PIPELINE
 # =====================================================================
 def fmt_ts(seconds: float) -> str:
@@ -4344,11 +5145,22 @@ def run_weekly_recap_pipeline(output_filename: Optional[str] = None, upload: boo
         assemble_final_video(scene_paths, cursor, output_filename, work_dir)
         logger.info(f"SUCCESS! Video saved as: {output_filename} ({fmt_ts(cursor)})")
 
+        # ---- Phase F: thumbnail. Runs once the video is safely saved, so a thumbnail problem can never cost a render ----
+        thumbnail_path: Optional[str] = None
+        try:
+            thumb_file = Path(output_filename).with_name(
+                f"THUMBNAIL_WEEKLY_RECAP_{datetime.date.today().isoformat()}.png")
+            thumbnail_path = ThumbnailEngine(outline.thumbnail).save(thumb_file)
+            logger.info("Thumbnail saved as: %s (%s, '%s')", thumbnail_path, ev(outline.thumbnail.template),
+                        outline.thumbnail.main_text)
+        except Exception as e:
+            logger.warning("Thumbnail generation failed (the video is unaffected): %s", e)
+
         if upload:
             from uploader import upload_video
             logger.info("Uploading to YouTube...")
             upload_video(file_path=output_filename, title=youtube_title, description=description, tags=tags,
-                         category_id="27")
+                         category_id="25", thumbnail_path=thumbnail_path)
             logger.info(f"Uploaded to YouTube: {youtube_title}")
         log_memory("pipeline finished")
         return output_filename
