@@ -40,9 +40,10 @@ if "WEBHOOK_TOKEN" in query_params:
             st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
             st.stop()
         elif video_type == "myth_buster":
-            filename = run_myth_buster_pipeline(upload=True)
-            st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
-            st.stop()
+            logger.warning("Myth Buster Shorts Temporarily disabled")
+            #filename = run_myth_buster_pipeline(upload=True)
+            #st.success(f"✅ הסרטון נוצר בהצלחה: {filename}")
+            #st.stop()
         elif video_type == "daily_summery":
             filename = "perfect_daily_recap.mp4"
             run_perfect_pipeline(output_filename=filename, upload=True)
@@ -55,7 +56,6 @@ if "WEBHOOK_TOKEN" in query_params:
             st.stop()
         elif video_type == "ping":
             logger.warning("🟢 [PING] Keep-Alive Ping Received!")
-            print("🟢 [PING] Server is awake and ready!", file=sys.stderr, flush=True)
             st.write("🟢 Keep-Alive Ping Received! Server is awake and ready.")
             st.stop()
     else:

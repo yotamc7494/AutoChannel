@@ -95,7 +95,7 @@ BG_MUSIC_FADE_OUT = 3.0
 USE_MUSIC = True
 
 # --- Parallelism / memory ---
-IO_WORKERS = 4
+IO_WORKERS = 1
 RENDER_IN_SUBPROCESS = True
 RENDER_WORKERS = int(os.environ.get("RECAP_RENDER_WORKERS", max(1, min(3, (os.cpu_count() or 2) // 2))))
 FFMPEG_THREADS = 2
