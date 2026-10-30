@@ -3,6 +3,8 @@ import os
 import sys
 import base64
 import json
+import time
+from pathlib import Path
 import streamlit.components.v1 as components
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -279,10 +281,47 @@ def display_and_download_video(video_path: str):
 
 
 # ---------------------------------------------------------
+# תצוגה והורדה של תמונה ממוזערת במצב ניסיון (סיכום יומי / שבועי)
+# ---------------------------------------------------------
+def display_and_download_thumbnail(video_path: str, video_type: str, generation_started_at: float):
+    # Both recap pipelines save their PNG beside the completed MP4 even if upload=False.
+    pattern_by_type = {
+        "סיכום יומי (משודרג)": "THUMBNAIL_DAILY_SHORT_*.png",
+        "סיכום שבועי": "THUMBNAIL_WEEKLY_RECAP_*.png",
+    }
+    pattern = pattern_by_type.get(video_type)
+    if not pattern:
+        return  # The other video types do not use this thumbnail pipeline.
+
+    output_dir = Path(video_path).resolve().parent
+    # Filenames include the generation date. Match it by pattern so a render
+    # crossing midnight still works, but never show an older run's thumbnail.
+    candidates = [
+        path for path in output_dir.glob(pattern)
+        if path.is_file() and path.stat().st_mtime >= generation_started_at - 2
+    ]
+    if not candidates:
+        st.warning("⚠️ לא נמצאה תמונה ממוזערת חדשה לסרטון זה. ייתכן שיצירת התמונה נכשלה.")
+        return
+
+    thumbnail_path = max(candidates, key=lambda path: path.stat().st_mtime)
+    st.subheader("🖼️ תצוגה מקדימה של התמונה הממוזערת:")
+    st.image(str(thumbnail_path), use_container_width=True)
+    st.download_button(
+        label="📥 הורדת תמונה ממוזערת (PNG)",
+        data=thumbnail_path.read_bytes(),
+        file_name=thumbnail_path.name,
+        mime="image/png",
+        key="btn_download_thumbnail",
+    )
+
+
+# ---------------------------------------------------------
 # הרצת הפייפליין לפי בחירת המשתמש
 # ---------------------------------------------------------
 st.write("---")
 if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
+    generation_started_at = time.time()
     should_upload = upload_to_yt and not is_test_mode
 
     with st.spinner(f"⏳ מפיק סרטון {video_type}..."):
@@ -309,6 +348,8 @@ if st.button("🚀 התחל יצירת סרטון", use_container_width=True):
 
             # הצגה והורדה
             display_and_download_video(video_path)
+            if is_test_mode:
+                display_and_download_thumbnail(video_path, video_type, generation_started_at)
 
         except Exception as e:
             st.error(f"❌ שגיאה במהלך יצירת הסרטון: {e}")
