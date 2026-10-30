@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import random
 import asyncio
+import datetime
 import gc
 import concurrent.futures
+import inspect
 import json
 import logging
 import math
@@ -26,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
@@ -149,6 +151,19 @@ class StockAnalysis(BaseModel):
     highlight_type: str = Field(default="none", description="Type of overlay: 'breakout', 'support', 'resistance', or 'none'")
 
 
+class ThumbnailIdea(BaseModel):
+    """The LLM's idea for the YouTube thumbnail. The featured stock, the colours, the % badge and the candles are
+    all decided/verified in code (see build_thumbnail_job + thumbnail.py); the LLM only picks the angle and text."""
+    template: str = Field(description="'candle_hero' (real candlestick chart + logo + % badge + surprised face) or 'massive_number' (giant headline only)")
+    ticker: str = Field(description="Ticker of the ONE analyzed stock to feature, copied exactly from analyzed_stocks")
+    main_text: str = Field(description="MAX 3 WORDS, UPPERCASE clickbait about that stock, e.g. 'NVIDIA EXPLODES?'. Must match the direction of its verified move. No emojis, dollar signs or numbers.")
+    avatar_emotion: str = Field(description="'shocked', 'pointing', 'thinking' or 'neutral'")
+
+
+THUMBNAIL_FALLBACK = {"template": "candle_hero", "ticker": "", "main_text": "MARKET MOVERS",
+                      "avatar_emotion": "shocked"}
+
+
 class FullVideoScriptSchema(BaseModel):
     intro_script: str = Field(description="STRICTLY 10 to 15 words. A fast, punchy English hook stating the market direction. No filler words, no 'watch till the end', no CTA.")
     news_ticker_text: str = Field(description="Single line ticker with top 3-5 market headlines + short 4-word summary each, separated by '  •  ' e.g. 'FED CUTS RATES: Policy shifted dovish  •  NVDA SURGES: AI chip demand peaks'")
@@ -156,6 +171,16 @@ class FullVideoScriptSchema(BaseModel):
     youtube_title: str
     description: str
     tags: str
+    thumbnail: ThumbnailIdea
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_missing_thumbnail(cls, data: Any) -> Any:
+        """A response without a thumbnail idea must never cost the whole script: use a neutral default."""
+        if isinstance(data, dict) and not data.get("thumbnail"):
+            logger.warning("Script has no thumbnail idea; using the default")
+            data = {**data, "thumbnail": dict(THUMBNAIL_FALLBACK)}
+        return data
 
 
 # Heavy dependencies are imported only where used:
@@ -480,6 +505,14 @@ def generate_verified_script(market_summary: str, verified_market_data: dict) ->
        Explain ONLY the fundamental reason behind the stock's move today. Do NOT mention prices, price levels, percentages, or any numbers.
 
     5. ABSOLUTELY NO EMOJIS or Dollar Symbols in any field. Write for natural Text-To-Speech reading.
+
+    6. "thumbnail": design the YouTube thumbnail (it is NOT spoken).
+       - "ticker": the ONE stock from analyzed_stocks with the biggest or most surprising move today according to the Verified Market Data. Copy its ticker exactly.
+       - "template": "candle_hero" (that stock's real candlestick chart, logo and verified percent badge next to a surprised face). Use "massive_number" only if no single stock stands out.
+       - "main_text": MAX 3 WORDS, UPPERCASE, a clickbait question or exclamation about that stock, e.g. "NVIDIA EXPLODES?" or "TESLA CRASH?".
+         It MUST match the DIRECTION of that stock's verified pct_change: never say crash for a stock that rose, never say surge for one that fell.
+         No emojis, no dollar signs, no numbers, no [[placeholders]].
+       - "avatar_emotion": "shocked", "pointing", "thinking" or "neutral" ("shocked" suits big moves).
     """
     from google.genai import types
     response = ask_llm(prompt, config=types.GenerateContentConfig(
@@ -1173,6 +1206,70 @@ def assemble_final_video(scene_paths: List[str], voice_tracks: List[Tuple[str, f
 
 
 # =====================================================================
+# 10b. THUMBNAIL  (Pillow only, built AFTER the video is saved; the engine lives in thumbnail.py)
+#      The LLM only suggests the angle and the text. The featured stock, the candles, the colours and the
+#      % badge are decided / verified here and in thumbnail.py, so the thumbnail can never promise a lie.
+# =====================================================================
+THUMB_CANDLES_KEPT = 60   # candles kept for the thumbnail (the engine merges them down to ~18 chunky ones)
+
+
+def build_thumbnail_job(script: FullVideoScriptSchema, stocks: List[StockAnalysis], histories: list,
+                        verified_data: dict) -> dict:
+    """Pick the featured stock and keep only the tiny bits the thumbnail needs (a short candle list + the verified
+    % move), so the big price DataFrames can still be freed before rendering."""
+    from thumbnail import coerce_candles
+    idea = script.thumbnail
+    spec = dict(template=idea.template, main_text=idea.main_text, primary_ticker="", secondary_ticker="",
+                trend="neutral", avatar_emotion=idea.avatar_emotion)
+    job = dict(spec=spec, candles=None, pct=None)
+    if str(idea.template).strip().lower() != "candle_hero":
+        return job
+
+    usable = [(s, df) for s, df in zip(stocks, histories) if df is not None and len(df) >= 6]
+    if not usable:
+        return job
+    wanted = re.sub(r"[^A-Za-z0-9.\-]", "", idea.ticker or "").upper()
+
+    def verified_move(item) -> float:
+        return abs((verified_data.get(item[0].ticker.upper()) or {}).get("pct_change") or 0.0)
+
+    pick = next((it for it in usable if it[0].ticker.upper() == wanted), None)
+    if pick is None:  # the LLM named a stock we cannot chart: take the biggest VERIFIED mover instead
+        pick = max(usable, key=verified_move)
+        logger.warning("Thumbnail ticker '%s' unavailable; featuring %s instead", wanted, pick[0].ticker)
+    stock, df = pick
+    ticker = stock.ticker.upper()
+    spec["primary_ticker"] = ticker
+    job["candles"] = coerce_candles(df, THUMB_CANDLES_KEPT)
+    pct = (verified_data.get(ticker) or {}).get("pct_change")
+    if pct is None:
+        row = _fetch_close_change(ticker, "5d")
+        pct = row["pct"] if row else None
+    job["pct"] = pct
+    if pick[0].ticker.upper() != wanted:  # the written headline is about another stock: replace it
+        first_word = (stock.company_spoken_name.split() or [ticker])[0].upper()
+        spec["main_text"] = f"{first_word} {'SURGES' if (pct or 0) >= 0 else 'SLIDES'}?"
+    return job
+
+
+def make_daily_thumbnail(job: Optional[dict], output_filename: str) -> Optional[str]:
+    """9:16 (1080x1920) thumbnail next to the video. Never raises: a thumbnail problem must not cost a render."""
+    if not job:
+        return None
+    try:
+        from thumbnail import PORTRAIT, ThumbnailEngine
+        thumb_file = Path(output_filename).with_name(f"THUMBNAIL_DAILY_SHORT_{datetime.date.today().isoformat()}.png")
+        engine = ThumbnailEngine(job["spec"], size=PORTRAIT, candles=job["candles"], pct=job["pct"],
+                                 pct_label="TODAY", default_text="MARKET MOVERS")
+        path = engine.save(thumb_file)
+        logger.info("🖼️ Thumbnail saved as %s (%s, '%s')", path, engine.template, engine.text)
+        return path
+    except Exception as e:
+        logger.warning("Thumbnail generation failed (the video is unaffected): %s", e)
+        return None
+
+
+# =====================================================================
 # 11. PIPELINE
 # =====================================================================
 def run_perfect_pipeline(
@@ -1241,6 +1338,14 @@ def run_perfect_pipeline(
         if "#shorts" not in final_description.lower():
             final_description += "\n\n#Shorts"
 
+        # Thumbnail inputs are picked while the price data is still in memory (tiny: a short candle list and
+        # one verified number). The thumbnail itself is drawn after the video is saved.
+        thumb_job = None
+        try:
+            thumb_job = build_thumbnail_job(script, stocks, histories, verified_data)
+        except Exception as e:
+            logger.warning("Thumbnail preparation failed (the video is unaffected): %s", e)
+
         # ---- Phase C: render + assemble ----
         # Drop redundant history references before rendering, jobs now own the inputs.
         del histories, stocks, market_data
@@ -1249,16 +1354,27 @@ def run_perfect_pipeline(
         log_memory("scenes rendered")
         assemble_final_video(scene_paths, voice_tracks, total_frames, bg_music_path, output_filename, work_dir)
 
+        # ---- Phase C2: thumbnail (9:16), only after the video is safely on disk ----
+        thumbnail_path = make_daily_thumbnail(thumb_job, output_filename)
+
         # ---- Phase D: upload ----
         if upload:
             from uploader import upload_video  # import only when an upload is requested
             logger.info("🚀 Uploading Short to YouTube...")
+            extra = {}
+            if thumbnail_path:
+                if "thumbnail_path" in inspect.signature(upload_video).parameters:
+                    extra["thumbnail_path"] = thumbnail_path
+                else:
+                    logger.info("uploader.upload_video has no thumbnail_path parameter; thumbnail kept at %s",
+                                thumbnail_path)
             upload_video(
                 file_path=output_filename,
                 title=script.youtube_title,
                 description=final_description,
                 tags=script.tags,
                 category_id="25",
+                **extra,
             )
 
         log_memory("pipeline finished")
