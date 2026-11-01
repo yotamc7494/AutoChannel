@@ -269,7 +269,6 @@ class SfxType(str, Enum):
     none = "none"
     cash_register = "cash_register"
     swoosh = "swoosh"
-    buzzer = "buzzer"
     heartbeat = "heartbeat"
 
 
@@ -2403,11 +2402,6 @@ def synth_sfx(name: str, sr: int = SFX_SR) -> np.ndarray:
         place(buf, bell(1568.0) * 0.8, 0.10)
         place(buf, bell(2093.0), 0.22)
         return norm(buf)
-    if name == "buzzer":
-        t = tt(0.6)
-        sq = np.sign(np.sin(2 * np.pi * 150 * t)) * 0.6 + np.sign(np.sin(2 * np.pi * 156 * t)) * 0.4
-        env = np.minimum(1, t / 0.01) * np.minimum(1, (0.6 - t) / 0.05)
-        return norm(np.tanh(1.8 * sq) * env)
     if name == "heartbeat":
         buf = np.zeros(int(1.7 * sr))
         t = tt(0.35)
